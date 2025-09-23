@@ -1,0 +1,89 @@
+Fase 1 – Fundamentos do Core
+
+Esses módulos são a base. Nada pode existir sem eles.
+
+1. logging.py → sistema de logs global (stdout, arquivo, níveis de debug, cores).
+2. config.py → parser de config.yaml, make.conf e variáveis globais.
+3. db.py → banco de dados local de pacotes instalados (SQLite ou JSON/YAML).
+
+Fase 2 – Controle de Regras e Metadados
+
+Depois da base, vem o controle de pacotes.
+4. masks.py → máscaras de pacotes (keywords, arch, ~unstable, bloqueios).
+5. slots.py → suporte a múltiplas versões (slots, subslots, ABI).
+6. repo_sync.py → sincronização de repositórios (rsync, git, tarballs).
+
+Fase 3 – Gerenciamento de Fontes e Construção
+
+Agora tratamos como buscar, compilar e instalar pacotes.
+7. fetcher.py → download de fontes (HTTP, FTP, Git, mirrors).
+8. patches.py → aplicação de patches antes da build.
+9. hooks.py → pré/pós build/remove/install (integração com .meta).
+10. sandbox.py → isolamento da compilação (chroot, namespaces, fakeroot).
+11. buildsystem.py → abstração de autotools, meson, cmake, make.
+
+Fase 4 – Operações Diretas de Pacotes
+
+Aqui já temos um sistema funcional de instalar/remover pacotes.
+12. resolver.py → resolve dependências, árvores de deps, conflitos.
+13. pkgtool.py → empacotamento binário (quickpkg, cache, reuso).
+14. deepclean.py → limpeza de dependências órfãs e builds temporários.
+15. conflicts.py → detecção e resolução de conflitos de arquivos/pacotes.
+
+Fase 5 – Manutenção e Auditoria
+
+Agora adicionamos as funções de manutenção do sistema.
+16. audit.py → auditoria de sistema, integridade de arquivos.
+17. upgrade.py → atualização de pacotes + auditoria pós-upgrade.
+18. query_tools.py → consulta (qlist, qdepends, qfiles).
+19. toolchain.py → gerenciamento de GCC/LLVM, múltiplas toolchains.
+
+Fase 6 – Extras e Integração
+
+Aqui entram melhorias e qualidade de vida.
+20. update_notifier.py → checa upstream e mostra notificações (notify-send, status bar).
+21. cli.py → interface de linha de comando, integra todos os módulos.
+22. executável qmeta → atalho em /usr/bin para rodar o CLI.
+23. instalador → script de instalação (/usr/lib/qmeta1.0 + binário).
+24. .meta format → definição final do formato de receita com todos os campos suportados.
+
+Sequência correta em resumo:
+
+logging → config → db → masks → slots → repo_sync → fetcher → patches → hooks → sandbox → buildsystem → resolver → pkgtool → deepclean → conflicts → audit → upgrade → query_tools → toolchain → update_notifier → cli → executável → instalador → .meta
+
+Qmeta
+├── Core
+│   ├── logging.py
+│   ├── config.py
+│   └── db.py
+│
+├── Regras e Políticas
+│   ├── masks.py   (usa: config, db)
+│   ├── slots.py   (usa: config, db)
+│   └── repo_sync.py (usa: config, db, logging)
+│
+├── Fonte → Build
+│   ├── fetcher.py     (usa: repo_sync, config, logging)
+│   ├── patches.py     (usa: fetcher, logging)
+│   ├── hooks.py       (usa: config, db, logging)
+│   ├── sandbox.py     (usa: config, db, logging)
+│   └── buildsystem.py (usa: fetcher, patches, sandbox, hooks, config)
+│
+├── Operações de Pacotes
+│   ├── resolver.py   (usa: db, masks, slots, logging)
+│   ├── pkgtool.py    (usa: db, resolver, buildsystem, logging)
+│   ├── deepclean.py  (usa: db, resolver, pkgtool, logging)
+│   └── conflicts.py  (usa: db, pkgtool, logging)
+│
+├── Manutenção
+│   ├── audit.py       (usa: db, pkgtool, conflicts, logging)
+│   ├── upgrade.py     (usa: resolver, audit, db, logging)
+│   ├── query_tools.py (usa: db, resolver, logging)
+│   └── toolchain.py   (usa: db, buildsystem, sandbox, logging)
+│
+├── Extras
+│   ├── update_notifier.py (usa: repo_sync, resolver, db, logging)
+│   ├── cli.py             (integra todos os anteriores)
+│   ├── qmeta (executável wrapper para cli.py)
+│   ├── installer.sh (instala /usr/lib/qmeta1.0 + /usr/bin/qmeta)
+│   └── .meta format (suporta todas as features dos módulos)
