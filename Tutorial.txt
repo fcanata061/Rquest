@@ -83,6 +83,8 @@ Sistemas de arquivos opcionais:
   rquest toolchain bootstrap → inicia stage1
   rquest toolchain switch <c>→ muda compilador padrão
   rquest toolchain list      → mostra toolchains disponíveis
+  rquest toolchain build binutils-pass2
+  rquest toolchain rebuild-all
 
 [Auditoria & manutenção]
   rquest audit               → verifica integridade
