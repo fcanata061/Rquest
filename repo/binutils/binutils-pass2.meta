@@ -1,0 +1,75 @@
+package:
+  name: binutils-pass2
+  version: 2.41
+  release: 1
+  category: toolchain
+  summary: "Binutils (passo 2) — reconfiguração para validação do toolchain"
+  description: |
+    Este é o segundo estágio de compilação do GNU Binutils, usando o GCC-pass1
+    como compilador. Ele substitui o binutils-pass1 no diretório $LFS/tools
+    e garante que o toolchain cross-compilation esteja consistente.
+
+upstream:
+  url: https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz
+  protocol: https
+  checksum: "sha256:fc7b99ecbf5eebf2f61fae50a6f9712b3a793bcee664f645dd5bb7b2d8e9f822"
+
+dependencies:
+  build:
+    - gcc-pass1
+    - binutils-pass1
+    - make
+    - bash
+    - coreutils
+    - gawk
+    - texinfo
+  runtime: []
+
+environment:
+  variables:
+    LFS: "/mnt/lfs"
+    LFS_TGT: "x86_64-lfs-linux-gnu"
+    PATH: "$LFS/tools/bin:/usr/bin:/bin"
+
+prepare:
+  steps:
+    - "tar -xf binutils-2.41.tar.xz"
+    - "cd binutils-2.41"
+    - "mkdir -v build && cd build"
+
+build:
+  steps:
+    - "../configure --prefix=$LFS/tools \
+        --with-sysroot=$LFS \
+        --target=$LFS_TGT \
+        --disable-nls \
+        --enable-gprofng=no \
+        --disable-werror"
+    - "make -j$(nproc)"
+
+install:
+  steps:
+    - "make install DESTDIR=$LFS"
+
+hooks:
+  pre-configure: []
+  post-configure: []
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install:
+    - "echo 'Binutils pass2 instalado em $LFS/tools usando GCC-pass1'"
+
+files:
+  - "$LFS/tools/bin/*"
+  - "$LFS/tools/$LFS_TGT/bin/*"
+
+metadata:
+  maintainer: "Equipe Rquest"
+  license: "GPL-3.0-or-later"
+  homepage: "https://www.gnu.org/software/binutils/"
+  tags:
+    - toolchain
+    - bootstrap
+    - cross-compiler
+    - pass2
