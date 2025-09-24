@@ -1,0 +1,94 @@
+# ================================
+# Rquest Configuração Principal
+# ================================
+
+network:
+  mirrorlist:
+    - "https://mirror1.example.org/rquest"
+    - "ftp://ftp.example.org/pub/rquest"
+  retries: 3
+  timeout: 30
+  parallel_downloads: 4   # downloads simultâneos para acelerar
+
+database:
+  state: "/var/lib/rquest/state.db"
+  cache: "/var/cache/rquest"
+  logs: "/var/log/rquest"
+
+logging:
+  level: "INFO"
+  file: "/var/log/rquest/rquest.log"
+  color: true
+  follow: true   # permite tail -f em tempo real
+
+sandbox:
+  enabled: true
+  backend: "bwrap"        # alternativas: firejail, systemd-nspawn
+  mount_tmpfs: true
+  network_isolation: true
+  home_readonly: true
+  cgroups: true
+
+repos:
+  # Repositório consolidado (local) que o Rquest usa sempre
+  local: "/var/db/rquest/local-repo"
+
+  # Repositórios remotos em git usados apenas para sincronização
+  remotes:
+    - name: "main"
+      type: "git"
+      url: "https://github.com/SEU_USUARIO/seu-repo-metas.git"
+      branch: "main"
+      sync_to: "/var/db/rquest/local-repo"
+
+    - name: "overlay"
+      type: "git"
+      url: "https://github.com/SEU_USUARIO/rquest-overlay.git"
+      branch: "main"
+      sync_to: "/var/db/rquest/local-repo"
+
+build:
+  jobs: 8               # número de jobs (make -j)
+  ccache: true          # habilitar cache de compilação
+  distcc: false         # habilitar se tiver cluster de build
+  fakeroot: true        # usar fakeroot para instalações em /usr
+  sharding: true        # compila em blocos menores p/ builds grandes
+  keep_temps: false     # se true, mantém diretórios temporários
+
+hooks:
+  enabled: true
+  stages: ["pre-patch", "post-patch", "pre-configure", "post-configure", "pre-install", "post-install", "pre-remove", "post-remove"]
+  inline_allowed: true
+  sandboxed: true
+
+audit:
+  enabled: true
+  integrity_check: true
+  file_conflict_check: true
+  orphan_check: true
+  snapshot_before_install: true   # snapshots btrfs/zfs antes de instalar/remover
+  snapshot_after_upgrade: true
+
+update_notifier:
+  enabled: true
+  check_interval: 3600    # em segundos
+  notify_method: "notify-send"
+  status_bar: true
+  total_updates_count: true
+
+toolchain:
+  default: "gcc"
+  gcc:
+    versions: ["13.2", "14.0"]
+  llvm:
+    versions: ["16", "17"]
+  bootstrap:
+    enabled: true
+    stage1_dir: "/var/db/rquest/bootstrap"
+
+python:
+  versions:
+    - "3.11"
+    - "3.12"
+  default: "3.12"
+  strict_compatibility: true
