@@ -1,0 +1,85 @@
+package:
+  name: binutils
+  version: 2.41
+  release: 1
+  category: base
+  summary: "GNU Binutils — ferramentas de linking e assembly"
+  description: |
+    O GNU Binutils é um conjunto de ferramentas essenciais para o desenvolvimento
+    de sistemas, incluindo o assembler (as), linker (ld), e diversas utilidades
+    como objdump, nm, ranlib e strings. Este é o build final, substituindo os
+    estágios bootstrap (pass1, pass2, pass3).
+
+upstream:
+  url: https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz
+  protocol: https
+  checksum: "sha256:fc7b99ecbf5eebf2f61fae50a6f9712b3a793bcee664f645dd5bb7b2d8e9f822"
+
+dependencies:
+  build:
+    - gcc
+    - glibc
+    - make
+    - bash
+    - coreutils
+    - gawk
+    - texinfo
+  runtime:
+    - glibc
+
+environment:
+  variables:
+    PATH: "/usr/bin:/bin"
+
+prepare:
+  steps:
+    - "tar -xf binutils-2.41.tar.xz"
+    - "cd binutils-2.41"
+    - "mkdir -v build && cd build"
+
+build:
+  steps:
+    - "../configure --prefix=/usr \
+        --enable-gold \
+        --enable-ld=default \
+        --enable-plugins \
+        --enable-shared \
+        --disable-werror \
+        --with-system-zlib"
+    - "make -j$(nproc)"
+
+check:
+  steps:
+    - "make -k check || true"
+
+install:
+  steps:
+    - "make install"
+    - "rm -v /usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes}.a"
+    - "install -v -m644 ../include/libiberty.h /usr/include"
+
+hooks:
+  pre-configure: []
+  post-configure: []
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install:
+    - "echo 'Binutils final instalado em /usr'"
+
+files:
+  - "/usr/bin/*"
+  - "/usr/lib/*"
+  - "/usr/include/*"
+  - "/usr/share/info/*"
+  - "/usr/share/man/*"
+
+metadata:
+  maintainer: "Equipe Rquest"
+  license: "GPL-3.0-or-later"
+  homepage: "https://www.gnu.org/software/binutils/"
+  tags:
+    - base
+    - toolchain
+    - assembler
+    - linker
