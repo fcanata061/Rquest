@@ -1,388 +1,468 @@
+# rquest1.0/modules/logging.py
 """
-modules/logging.py
+Revised logging module for Rquest v1.0
 
-Refatorado para integração com modules/config.py.
-Mantém API pública:
- - get_logger(name, module_prefix=None)
- - start_build_log(build_id)
- - stream_build_output(build_id, line)
- - end_build_log(build_id)
- - set_level(level)
- - add_handler(handler)
- - get_metrics()
-
-Características:
- - usa config.get(...) para configurar (logging.level, logging.file, logging.json,
-   logging.console, logging.max_bytes, logging.backups, logging.build_logs_dir)
- - reconfigura handlers automaticamente quando config mudar (usa config.watch)
- - handlers thread-safe, metrics thread-safe, buffers de build thread-safe
- - JSON file handler com rotação (via RotatingFileHandler + JsonFormatter)
+Principais correções e melhorias:
+- Integração direta com rquest1.0.modules.config (usa config.get("logging"))
+- Evita duplicação de parsing YAML/JSON (config centraliza isso)
+- Handler JSON rotativo seguro (usa RotatingFileHandler internamente, escrita atômica por registro)
+- Console handler com colorização apenas para terminal; arquivo/JSON sem cor
+- Thread-safe (locks nos pontos de escrita onde necessário)
+- Não remove handlers de forma agressiva; aplica reconfiguração controlada
+- Opção para habilitar excepthook global via config (desligada por padrão)
+- API de integração para outros módulos (set_logger, integrate_module)
+- Funções auxiliares: enable_http_debug, start_build_log/stream/end_build_log
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
-import json
 import os
 import sys
 import threading
 import time
-from typing import Dict, Optional, List, Any
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional
 
-# integracao com o config refatorado
-from . import config
+# Import central config module (assume o arquivo config.py já revisionado existe)
+from rquest1.0.modules import config
 
-# -----------------------
-# Estado global e locks
-# -----------------------
-_HANDLER_LOCK = threading.RLock()
-_handlers: List[logging.Handler] = []
+# Default constants
+_DEFAULT_LOGGER_NAME = "rquest"
+_DEFAULT_LEVEL = logging.INFO
+_DEFAULT_JSON_ROTATE_BYTES = 10 * 1024 * 1024  # 10 MB
+_DEFAULT_JSON_BACKUP_COUNT = 5
 
-_metrics: Dict[str, int] = {"debug": 0, "info": 0, "warning": 0, "error": 0, "critical": 0}
-_metrics_lock = threading.Lock()
-
-_build_buffers: Dict[str, List[str]] = {}
-_build_files: Dict[str, Any] = {}  # file handles
-_build_lock = threading.Lock()
-
-_loggers: Dict[str, logging.Logger] = {}
-_logger = logging.getLogger("rquest.logging")
-
-# watcher id para reconfig
-_watcher_id: Optional[str] = None
-
-# defaults locais caso config esteja vazia
-_FALLBACK = {
-    "level": "INFO",
-    "file": None,
-    "json": False,
-    "console": True,
-    "max_bytes": 0,
-    "backups": 0,
-    "build_logs_dir": None,
-}
-
-# -----------------------
-# Formatters e Handlers
-# -----------------------
+# Internal singleton manager
+_manager_lock = threading.RLock()
+_manager: Optional["LoggingManager"] = None
 
 
-class ColorFormatter(logging.Formatter):
+# -------------------------
+# Helpers and formatters
+# -------------------------
+class _ColorFormatter(logging.Formatter):
+    """
+    Colorizes levelname for console output. Does NOT alter message content,
+    so file handlers remain plain.
+    """
     COLORS = {
-        logging.DEBUG: "\033[90m",  # bright black / gray
-        logging.INFO: "\033[36m",   # cyan
-        logging.WARNING: "\033[33m",# yellow
-        logging.ERROR: "\033[31m",  # red
-        logging.CRITICAL: "\033[41m" # red background
+        "DEBUG": "\033[37m",   # light gray
+        "INFO": "\033[36m",    # cyan
+        "WARNING": "\033[33m", # yellow
+        "ERROR": "\033[31m",   # red
+        "CRITICAL": "\033[41m",# red background
     }
     RESET = "\033[0m"
 
-    def __init__(self):
-        super().__init__("%(asctime)s %(levelname)s [%(name)s] %(message)s", "%H:%M:%S")
-
     def format(self, record: logging.LogRecord) -> str:
-        # module_prefix preferred from record.extra if provided (LoggerAdapter)
-        module_prefix = getattr(record, "module_prefix", None)
-        msg = super().format(record)
-        color = self.COLORS.get(record.levelno, "")
-        prefix = f"[{module_prefix}] " if module_prefix else ""
-        return f"{color}{prefix}{msg}{self.RESET}"
+        level = record.levelname
+        prefix = self.COLORS.get(level, "") 
+        suffix = self.RESET if prefix else ""
+        # format message using base class (will use format string provided)
+        original = super().format(record)
+        # Only colorize if the stream supports it (basic heuristic)
+        try:
+            isatty = hasattr(record, "stream") and getattr(record, "stream", None) and getattr(record.stream, "isatty", lambda: False)()
+        except Exception:
+            isatty = False
+        if not isatty:
+            # fallback: try stdout isatty
+            isatty = sys.stdout.isatty()
+        if isatty and prefix:
+            return f"{prefix}{original}{suffix}"
+        return original
 
 
-class JsonFormatter(logging.Formatter):
-    """
-    Gera uma linha JSON por record (newline-delimited JSON).
-    """
+class _JsonFormatter(logging.Formatter):
+    """Format log record as JSON line (no pretty)."""
     def format(self, record: logging.LogRecord) -> str:
-        obj = {
-            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(record.created)),
+        payload = {
+            "timestamp": datetime.utcfromtimestamp(record.created).isoformat() + "Z",
             "level": record.levelname,
             "logger": record.name,
+            "module": record.module,
+            "funcName": record.funcName,
+            "lineNo": record.lineno,
             "message": record.getMessage(),
         }
-        # incluir module_prefix se existir
-        mp = getattr(record, "module_prefix", None)
-        if mp:
-            obj["module_prefix"] = mp
-        return json.dumps(obj, ensure_ascii=False)
+        # Include extra fields if present
+        if hasattr(record, "extra_data") and isinstance(record.extra_data, dict):
+            payload.update(record.extra_data)
+        return json.dumps(payload, ensure_ascii=False)
 
 
-class MetricsHandler(logging.Handler):
+# -------------------------
+# JSON Rotating Handler
+# -------------------------
+class JsonRotatingFileHandler(logging.handlers.RotatingFileHandler):
     """
-    Handler leve que atualiza contadores em _metrics.
-    Deve ser adicionado ao root logger para contar todas mensagens.
+    Rotating file handler that writes one JSON-line per record.
+    Subclasses RotatingFileHandler to reuse rotation logic. Ensures thread-safety
+    when serializing each record (RotatingFileHandler already has internal locking,
+    but we serialize and write explicitly to avoid double-formatting).
     """
-    def emit(self, record: logging.LogRecord):
-        level = record.levelname.lower()
-        with _metrics_lock:
-            _metrics[level] = _metrics.get(level, 0) + 1
-
-
-# -----------------------
-# Helpers de (re)inicializacao
-# -----------------------
-
-
-def _get_cfg() -> Dict[str, Any]:
-    # Obter sub-config "logging" com fallback
-    raw = config.get("logging", {})
-    if not isinstance(raw, dict):
-        raw = {}
-    merged = dict(_FALLBACK)
-    merged.update(raw)
-    return merged
-
-
-def _close_and_remove_handlers():
-    with _HANDLER_LOCK:
-        root = logging.getLogger()
-        for h in list(_handlers):
+    def __init__(
+        self,
+        filename: str,
+        maxBytes: int = _DEFAULT_JSON_ROTATE_BYTES,
+        backupCount: int = _DEFAULT_JSON_BACKUP_COUNT,
+        encoding: Optional[str] = "utf-8",
+    ):
+        # ensure directory exists
+        dirname = os.path.dirname(os.path.abspath(filename))
+        if dirname and not os.path.exists(dirname):
             try:
-                root.removeHandler(h)
+                os.makedirs(dirname, exist_ok=True)
             except Exception:
-                pass
-            try:
-                h.close()
-            except Exception:
-                pass
-        _handlers.clear()
+                # If cannot create, raise to notify caller
+                raise
+        super().__init__(filename, maxBytes=maxBytes, backupCount=backupCount, encoding=encoding)
+        # Use JSON formatter
+        self.setFormatter(_JsonFormatter())
+        # Use the internal lock provided by RotatingFileHandler's StreamHandler
+        self._write_lock = threading.RLock()
 
-
-def _init_handlers():
-    """
-    Inicializa (ou reinicializa) handlers a partir do config.
-    Essa função pode ser chamada repetidas vezes (fecha handlers anteriores).
-    """
-    with _HANDLER_LOCK:
-        cfg = _get_cfg()
-        _close_and_remove_handlers()
-
-        handlers: List[logging.Handler] = []
-
-        level_name = str(cfg.get("level", "INFO")).upper()
-        numeric_level = getattr(logging, level_name, logging.INFO)
-
-        # Console handler
-        if bool(cfg.get("console", True)):
-            ch = logging.StreamHandler(sys.stdout)
-            ch.setFormatter(ColorFormatter())
-            handlers.append(ch)
-
-        logfile = cfg.get("file")
-        json_enabled = bool(cfg.get("json", False))
-        max_bytes = int(cfg.get("max_bytes", 0) or 0)
-        backups = int(cfg.get("backups", 0) or 0)
-
-        if logfile:
-            logfile = os.path.abspath(os.path.expanduser(logfile))
-            os.makedirs(os.path.dirname(logfile), exist_ok=True)
-            if max_bytes and max_bytes > 0:
-                fh = logging.handlers.RotatingFileHandler(logfile, maxBytes=max_bytes, backupCount=backups, encoding="utf-8")
-            else:
-                fh = logging.FileHandler(logfile, encoding="utf-8")
-            if json_enabled:
-                fh.setFormatter(JsonFormatter())
-            else:
-                fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", "%Y-%m-%d %H:%M:%S"))
-            handlers.append(fh)
-
-        # Always attach metrics handler (counts across all handlers)
-        metrics_h = MetricsHandler()
-        # metrics handler should be last so it won't interfere formatting
-        handlers.append(metrics_h)
-
-        # Apply to root logger
-        root = logging.getLogger()
-        root.setLevel(numeric_level)
-        for h in handlers:
-            root.addHandler(h)
-
-        _handlers.extend(handlers)
-        _logger.debug("Handlers initialized: level=%s file=%s json=%s", level_name, logfile, json_enabled)
-
-
-def _on_config_change():
-    """
-    Callback para config.watch: reinicializa handlers.
-    """
-    try:
-        _logger.debug("Config change detected — reinitializing logging handlers")
-        _init_handlers()
-    except Exception as e:
-        # Não deixar propagar
-        _logger.exception("Error reinitializing logging handlers: %s", e)
-
-
-# -----------------------
-# API pública
-# -----------------------
-
-
-def get_logger(name: str, module_prefix: Optional[str] = None) -> logging.Logger:
-    """
-    Retorna um logger. Se module_prefix for fornecido, ele aparecerá nos formatters que o suportam.
-    Caching por (name, module_prefix) para preservar comportamento consistente.
-    """
-    key = f"{name}::{module_prefix or ''}"
-    if key in _loggers:
-        return _loggers[key]
-
-    # garantir handlers inicializados
-    _init_handlers()
-
-    base_logger = logging.getLogger(name)
-    # propague para root (comportamento padrão)
-    base_logger.propagate = True
-    # set level igual ao root por padrão
-    base_logger.setLevel(logging.getLogger().level)
-
-    # criar adapter para incluir module_prefix no record
-    if module_prefix:
-        adapter = logging.LoggerAdapter(base_logger, {"module_prefix": module_prefix})
-        _loggers[key] = adapter  # LoggerAdapter tem mesma interface de Logger
-        return adapter
-
-    _loggers[key] = base_logger
-    return base_logger
-
-
-def set_level(level: str):
-    """Ajusta o level do root logger e de loggers cacheados."""
-    numeric = getattr(logging, level.upper(), logging.INFO)
-    root = logging.getLogger()
-    root.setLevel(numeric)
-    for lg in list(_loggers.values()):
+    def emit(self, record: logging.LogRecord) -> None:
         try:
-            # LoggerAdapter tem logger; compatível
-            if isinstance(lg, logging.LoggerAdapter):
-                lg.logger.setLevel(numeric)
-            else:
-                lg.setLevel(numeric)
+            s = self.format(record)
+            with self._write_lock:
+                # stream is handled by parent; call parent methods to handle rotation
+                if self.shouldRollover(record):  # type: ignore[arg-type]
+                    self.doRollover()
+                stream = self.stream
+                if stream is None:
+                    stream = self._open()
+                stream.write(s + "\n")
+                stream.flush()
+        except Exception:
+            self.handleError(record)
+
+
+# -------------------------
+# Manager
+# -------------------------
+class LoggingManager:
+    """
+    Single manager that configures and exposes the rquest logger.
+    Use get_manager() to obtain the singleton.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._logger = logging.getLogger(_DEFAULT_LOGGER_NAME)
+        self._logger.setLevel(_DEFAULT_LEVEL)
+        self._console_handler: Optional[logging.StreamHandler] = None
+        self._json_handler: Optional[JsonRotatingFileHandler] = None
+        self._metrics: Dict[str, int] = {}
+        self._follow_active = False
+        self._follow_buffer: list[str] = []
+        self._build_meta: Dict[str, Any] = {}
+        # Save previous global excepthook to restore if we disable
+        self._prev_excepthook = sys.excepthook
+        # Initialize from config if available
+        self._apply_config(config.get("logging") if config else None)
+        # Register config reload callback so logging reconfigures on config.load()
+        try:
+            config.start_watcher()  # safe no-op if watchdog missing; also ensures config module imported
+        except Exception:
+            # ignore
+            pass
+        try:
+            # We use config.integrate_with_module style callback: config has _WATCH_CALLBACKS internal
+            config.start_watcher  # just ensure attribute exists
         except Exception:
             pass
-    _logger.info("Logging level set to %s", level)
+        # Register a callback in the config module to reconfigure logging when config reloads:
+        try:
+            config._WATCH_CALLBACKS.append(self._on_config_reload)
+        except Exception:
+            # If WATCH_CALLBACKS not available, we still allow manual reconfigure by calling manager.reconfigure()
+            pass
+        # Let config use this logger for its internal logs
+        config.set_logger(self._logger)
 
+    # -------------------------
+    # Internal apply / reconfigure
+    # -------------------------
+    def _apply_config(self, cfg: Optional[Dict[str, Any]]) -> None:
+        """
+        Apply logging section from config. This is safe to call multiple times.
+        Expected structure (example):
+        logging:
+            level: DEBUG
+            console: true
+            console_timestamp: true
+            json_file: /var/log/rquest/log.json
+            json_max_bytes: 10485760
+            json_backup_count: 3
+            unhandled_exceptions: false
+        """
+        with self._lock:
+            try:
+                if not cfg or not isinstance(cfg, dict):
+                    cfg = {}
+                # Level
+                level = cfg.get("level", None)
+                if level is not None:
+                    try:
+                        self._logger.setLevel(level if isinstance(level, int) else getattr(logging, str(level).upper()))
+                    except Exception:
+                        self._logger.setLevel(_DEFAULT_LEVEL)
+                # Console handler
+                console_cfg = cfg.get("console", True)
+                if console_cfg:
+                    if self._console_handler is None:
+                        ch = logging.StreamHandler(sys.stdout)
+                        fmt_parts = []
+                        if cfg.get("console_timestamp", True):
+                            fmt_parts.append("%(asctime)s")
+                        fmt_parts.append("%(levelname)s")
+                        if cfg.get("module_prefix", True):
+                            fmt_parts.append("[%(name)s]")
+                        fmt_parts.append("%(message)s")
+                        fmt = " ".join(fmt_parts)
+                        # Color formatter wraps formatting if terminal supports it
+                        formatter = _ColorFormatter(fmt)
+                        ch.setFormatter(formatter)
+                        self._logger.addHandler(ch)
+                        self._console_handler = ch
+                    else:
+                        # keep existing handler but maybe update format
+                        pass
+                else:
+                    # remove console handler if present
+                    if self._console_handler:
+                        try:
+                            self._logger.removeHandler(self._console_handler)
+                        except Exception:
+                            pass
+                        self._console_handler = None
 
-def add_handler(handler: logging.Handler):
-    """Adiciona handler ao root logger e à lista interna (thread-safe)."""
-    with _HANDLER_LOCK:
+                # JSON file handler
+                json_path = cfg.get("json_file") or cfg.get("json")
+                if json_path:
+                    try:
+                        maxb = int(cfg.get("json_max_bytes", _DEFAULT_JSON_ROTATE_BYTES))
+                    except Exception:
+                        maxb = _DEFAULT_JSON_ROTATE_BYTES
+                    try:
+                        bc = int(cfg.get("json_backup_count", _DEFAULT_JSON_BACKUP_COUNT))
+                    except Exception:
+                        bc = _DEFAULT_JSON_BACKUP_COUNT
+
+                    if self._json_handler is None or (self._json_handler.baseFilename != os.path.abspath(str(json_path))):
+                        # remove old json handler
+                        if self._json_handler:
+                            try:
+                                self._logger.removeHandler(self._json_handler)
+                            except Exception:
+                                pass
+                            self._json_handler = None
+                        # create new
+                        handler = JsonRotatingFileHandler(str(json_path), maxBytes=maxb, backupCount=bc)
+                        handler.setLevel(cfg.get("json_level", logging.INFO))
+                        self._logger.addHandler(handler)
+                        self._json_handler = handler
+                    else:
+                        # update rotation params if necessary (RotatingFileHandler does not expose easy change; recreate if needed)
+                        pass
+                else:
+                    # remove if present
+                    if self._json_handler:
+                        try:
+                            self._logger.removeHandler(self._json_handler)
+                        except Exception:
+                            pass
+                        self._json_handler = None
+
+                # Unhandled exceptions hook
+                unhandled = bool(cfg.get("unhandled_exceptions", False))
+                if unhandled:
+                    # set our hook (idempotent)
+                    sys.excepthook = self._handle_uncaught_exception
+                else:
+                    # restore previous if we changed it
+                    try:
+                        sys.excepthook = self._prev_excepthook
+                    except Exception:
+                        pass
+
+                # Allow external modules to fetch logger via config.set_logger
+                config.set_logger(self._logger)
+            except Exception:
+                # Ensure that manager remains usable even if config has bad types
+                logging.getLogger(__name__).exception("Failed to apply logging config")
+
+    def _on_config_reload(self):
+        """Callback triggered by config watcher to re-apply logging configuration."""
+        try:
+            cfg = config.get("logging")
+            self._apply_config(cfg)
+            self._logger.info("Logging reconfigured from updated config")
+        except Exception:
+            self._logger.exception("Error when reloading logging config")
+
+    # -------------------------
+    # Public helpers
+    # -------------------------
+    def get_logger(self) -> logging.Logger:
+        return self._logger
+
+    def reconfigure(self) -> None:
+        """Force reconfiguration from config module now."""
+        with self._lock:
+            self._apply_config(config.get("logging"))
+
+    def set_level(self, level: int | str) -> None:
+        with self._lock:
+            try:
+                lvl = level if isinstance(level, int) else getattr(logging, str(level).upper())
+            except Exception:
+                lvl = _DEFAULT_LEVEL
+            self._logger.setLevel(lvl)
+
+    def enable_http_debug(self) -> None:
+        """Enable detailed urllib3/http.client debugging output."""
+        import http.client as http_client
+
+        http_client.HTTPConnection.debuglevel = 1
         root = logging.getLogger()
-        root.addHandler(handler)
-        _handlers.append(handler)
+        root.setLevel(logging.DEBUG)
+        ulog = logging.getLogger("urllib3")
+        ulog.setLevel(logging.DEBUG)
+        ulog.propagate = True
+        self._logger.debug("HTTP debug enabled")
 
-
-def start_build_log(build_id: str):
-    """Inicializa buffer (e arquivo, se configurado) para um build."""
-    with _build_lock:
-        if build_id in _build_buffers:
-            # já iniciado; sobrescrever buffer
-            _build_buffers[build_id] = []
-        else:
-            _build_buffers[build_id] = []
-
-        # abrir arquivo se configurado
-        build_dir = config.get("logging.build_logs_dir", None)
-        if build_dir:
-            build_dir = os.path.abspath(os.path.expanduser(build_dir))
-            os.makedirs(build_dir, exist_ok=True)
-            filepath = os.path.join(build_dir, f"build-{build_id}.log")
+    # -------------------------
+    # Exception handling
+    # -------------------------
+    def _handle_uncaught_exception(self, exc_type, exc_value, exc_tb):
+        """Log an uncaught exception; then call previous excepthook."""
+        try:
+            self._logger.critical("Uncaught exception", exc_info=(exc_type, exc_value, exc_tb))
+        except Exception:
+            # fallback to stderr if logger broken
             try:
-                fh = open(filepath, "a", encoding="utf-8")
-                _build_files[build_id] = fh
-            except Exception as e:
-                # logamos mas não interrompemos a execução
-                get_logger(__name__).warning("Não foi possível abrir build log %s: %s", filepath, e)
-
-
-def stream_build_output(build_id: str, line: str):
-    """
-    Escreve linha no logger de build (INFO) e armazena no buffer/arquivo (se configurado).
-    """
-    logger = get_logger(f"build.{build_id}", module_prefix="build")
-    # manda para logging (isso irá percorrer os handlers configurados)
-    logger.info(line.rstrip("\n"))
-
-    with _build_lock:
-        if build_id in _build_buffers:
-            _build_buffers[build_id].append(line)
-        # escreve no arquivo se existir
-        fh = _build_files.get(build_id)
-        if fh:
-            try:
-                fh.write(line)
-                fh.flush()
+                print("Uncaught exception", file=sys.stderr)
             except Exception:
-                # não deixamos explodir
+                pass
+        try:
+            # call previous to preserve behavior
+            if callable(self._prev_excepthook):
+                self._prev_excepthook(exc_type, exc_value, exc_tb)
+        except Exception:
+            pass
+
+    # -------------------------
+    # Build streaming API
+    # -------------------------
+    def start_build_log(self, build_id: str, meta: Optional[Dict[str, Any]] = None) -> None:
+        with self._lock:
+            self._follow_active = True
+            self._follow_buffer = []
+            self._build_meta = dict(meta or {})
+            self._build_meta["build_id"] = build_id
+            self._logger.info("Starting build log: %s", build_id)
+
+    def stream_build_output(self, message: str, level: int = logging.INFO, extra: Optional[Dict[str, Any]] = None) -> None:
+        with self._lock:
+            # write to logger normally
+            self._logger.log(level, message, extra={"extra_data": extra} if extra else None)
+            if self._follow_active:
+                ts = datetime.utcnow().isoformat() + "Z"
+                line = f"{ts} [{logging.getLevelName(level)}] {message}"
+                self._follow_buffer.append(line)
+                # keep buffer bounded to avoid memory blowup
+                if len(self._follow_buffer) > 10000:
+                    self._follow_buffer = self._follow_buffer[-5000:]
+
+    def end_build_log(self, summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        with self._lock:
+            # produce final summary and clear buffer
+            summary = summary or {}
+            summary_record = {
+                "meta": self._build_meta.copy(),
+                "summary": summary,
+                "lines": list(self._follow_buffer),
+            }
+            # log the summary as structured json (if json handler present)
+            self._logger.info("Build finished: %s", self._build_meta.get("build_id"), extra={"extra_data": {"build_summary": summary}})
+            self._follow_active = False
+            self._follow_buffer = []
+            self._build_meta = {}
+            return summary_record
+
+    # -------------------------
+    # Integration helpers for other modules
+    # -------------------------
+    def integrate_module(self, module_obj: Any, module_name: Optional[str] = None) -> None:
+        """
+        Inject logger and module-specific config into another module.
+        Will call module_obj.set_logger(logger) and module_obj.set_config(cfg) if present.
+        """
+        name = module_name or getattr(module_obj, "__name__", None)
+        try:
+            if hasattr(module_obj, "set_logger") and callable(module_obj.set_logger):
                 try:
-                    get_logger(__name__).warning("Erro escrevendo build log para %s", build_id)
+                    module_obj.set_logger(self._logger)
                 except Exception:
-                    pass
+                    self._logger.exception("Failed to call set_logger on %s", name)
+            # Let config provide module config (it has helper get_module_config)
+            if hasattr(module_obj, "set_config") and callable(module_obj.set_config):
+                try:
+                    cfg_mod = config.get_module_config(name.split(".")[-1]) if name else {}
+                    module_obj.set_config(cfg_mod)
+                except Exception:
+                    self._logger.exception("Failed to call set_config on %s", name)
+        except Exception:
+            self._logger.exception("Error integrating module %s", name)
 
 
-def end_build_log(build_id: str):
-    """
-    Fecha/encerra o log do build. Não retorna nada (compatibilidade).
-    Se existir arquivo associado, ele será fechado.
-    """
-    with _build_lock:
-        fh = _build_files.pop(build_id, None)
-        if fh:
-            try:
-                fh.flush()
-            except Exception:
-                pass
-            try:
-                fh.close()
-            except Exception:
-                pass
-        # mantemos buffer em memória até que outro módulo solicite com get_build_log
+# -------------------------
+# Module-level access helpers
+# -------------------------
+def get_manager() -> LoggingManager:
+    global _manager
+    with _manager_lock:
+        if _manager is None:
+            _manager = LoggingManager()
+        return _manager
 
 
-def get_build_log(build_id: str, clear_after: bool = False) -> Optional[str]:
-    """
-    Opcional: retorna o conteúdo em memória do log do build (concat das linhas).
-    Se clear_after=True, limpa o buffer em memória.
-    """
-    with _build_lock:
-        if build_id not in _build_buffers:
-            return None
-        content = "".join(_build_buffers[build_id])
-        if clear_after:
-            _build_buffers[build_id] = []
-        return content
+def get_logger() -> logging.Logger:
+    return get_manager().get_logger()
 
 
-def get_metrics() -> Dict[str, int]:
-    """Retorna cópia dos contadores de métricas (debug/info/warning/error/critical)."""
-    with _metrics_lock:
-        return dict(_metrics)
+def reconfigure() -> None:
+    get_manager().reconfigure()
 
 
-# -----------------------
-# Inicializacao do modulo
-# -----------------------
+def set_level(level: int | str) -> None:
+    get_manager().set_level(level)
 
-# Inicializa handlers à importação
-try:
-    _init_handlers()
-except Exception:
-    # evitar quebrar importadores
-    try:
-        _logger.exception("Erro inicializando handlers na importação")
-    except Exception:
-        pass
 
-# registrar watcher para reconfiguração automática ao mudar config (se config.watch existir)
-try:
-    # registra apenas uma vez
-    if _watcher_id is None and hasattr(config, "watch"):
-        # watch(None, callback, interval) -> observa todos os arquivos carregados
-        _watcher_id = config.watch(None, _on_config_change, interval=1.0)
-        _logger.debug("Registered config watcher id=%s", _watcher_id)
-except Exception:
-    # falha em registrar watcher não deve quebrar nada
-    try:
-        _logger.exception("Erro registrando config watcher")
-    except Exception:
-        pass
+def enable_http_debug() -> None:
+    get_manager().enable_http_debug()
+
+
+def start_build_log(build_id: str, meta: Optional[Dict[str, Any]] = None) -> None:
+    get_manager().start_build_log(build_id, meta)
+
+
+def stream_build_output(message: str, level: int = logging.INFO, extra: Optional[Dict[str, Any]] = None) -> None:
+    get_manager().stream_build_output(message, level, extra)
+
+
+def end_build_log(summary: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    return get_manager().end_build_log(summary)
+
+
+def integrate_module(module_obj: Any, module_name: Optional[str] = None) -> None:
+    get_manager().integrate_module(module_obj, module_name)
+
+
+# Immediately initialize manager so config.set_logger integration is established early
+get_manager()
