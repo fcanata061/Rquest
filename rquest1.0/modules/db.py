@@ -1,977 +1,651 @@
-# Rquest/rquest1.0/modules/db.py
+# rquest1.0/modules/db.py
 """
-Rquest DB module - db.py
+db.py - SQLite wrapper and schema for Rquest
 
 Features:
-- SQLite backend (singleton)
-- Versioned migrations (meta.schema_version)
-- Tables: packages, dependencies, history, builds, shards, events, users, locks, configs
-- Build sharding: shards table, worker registration, acquire/release shard for builds, heartbeat
-- High-level API for packages, dependencies, builds, events, history, users, locks, config cache
-- Transaction context manager for safe transactions with rollback
-- Event listeners (callbacks) and async dispatch (threads)
-- Integration with config.py (get_config) and logging.py (get_logger)
-- Export/import JSON
+ - Reads DB path & options from modules.config.get_config() if available
+ - Thread-safe singleton connection wrapper
+ - Auto migration (initial schema v1)
+ - High-level helpers for packages, builds, toolchains, installed packages
+ - Event emitting / listeners
+ - JSON detail fields support
+ - Backup / export / import utilities
 """
 
 from __future__ import annotations
 
 import os
 import sqlite3
+import json
 import threading
 import time
-import json
-import traceback
+import shutil
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Callable
 
-# Robust imports from modules package (try several name variations to be flexible)
+# try to use the project's logging and config modules (graceful fallback)
 try:
-    from modules.config import get_config, get_db_path, get_buildsystem_config  # type: ignore
+    from modules.config import get_config  # type: ignore
 except Exception:
-    try:
-        # alternative names in case module is imported differently
-        from config import get_config, get_db_path, get_buildsystem_config  # type: ignore
-    except Exception:
-        # minimal fallback
-        def get_config():
-            return {}
-        def get_db_path():
-            return "./rquest.db"
-        def get_buildsystem_config():
-            return {"max_shards": 4}
+    def get_config():
+        return {}
 
-# logging integration (use project's logging if available)
 try:
     from modules.logging import get_logger  # type: ignore
+    logger = get_logger("db")
 except Exception:
+    import logging
+    logger = logging.getLogger("rquest.db")
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO)
+
+# -----------------------
+# Configuration
+# -----------------------
+CFG = get_config() if callable(get_config) else {}
+DB_CFG = CFG.get("database", {}) if isinstance(CFG, dict) else {}
+DB_PATH = DB_CFG.get("path") or CFG.get("db_path") or "/var/lib/rquest/db.sqlite3"
+DB_TIMEOUT = float(DB_CFG.get("timeout", 30))
+DB_JOURNAL = DB_CFG.get("journal_mode", "WAL")
+DB_SYNC = str(DB_CFG.get("synchronous", "NORMAL")).upper()
+
+# ensure directory exists
+_db_dir = os.path.dirname(DB_PATH)
+if _db_dir and not os.path.exists(_db_dir):
     try:
-        from logging import getLogger as _std_get_logger  # fallback to stdlib
-        def get_logger(name: str):
-            return _std_get_logger(name)
+        os.makedirs(_db_dir, exist_ok=True)
     except Exception:
-        def get_logger(name: str):
-            class _Fake:
-                def info(self, *a, **k): pass
-                def warning(self, *a, **k): pass
-                def error(self, *a, **k): pass
-                def debug(self, *a, **k): pass
-                def exception(self, *a, **k): pass
-            return _Fake()
+        # fallback to current dir
+        DB_PATH = os.path.join(os.getcwd(), "rquest-db.sqlite3")
 
-logger = get_logger("db")
-
-# ---------------------------------------------------------------------------
-# Constants and defaults
-# ---------------------------------------------------------------------------
-DEFAULT_DB_TIMEOUT = 30  # seconds
-DEFAULT_MAX_SHARDS = 4
-DEFAULT_SCHEMA_VERSION = 1
-
-# Lock to synchronize singleton creation
-_singleton_lock = threading.RLock()
-_db_singleton = None  # type: ignore
-
-# ---------------------------------------------------------------------------
+# -----------------------
 # Helper utilities
-# ---------------------------------------------------------------------------
-
+# -----------------------
 def _now_ts() -> int:
     return int(time.time())
 
-def _iso_now() -> str:
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+def _to_json_safe(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return json.dumps(str(obj))
 
-# ---------------------------------------------------------------------------
-# Database class
-# ---------------------------------------------------------------------------
+def _from_json_safe(s: Optional[str]) -> Any:
+    if s is None:
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return s
 
-class Database:
-    """
-    Singleton Database class managing SQLite connection, migrations, sharding of builds,
-    events, high-level API and listeners.
-    """
-
-    def __new__(cls, *args, **kwargs):
-        global _db_singleton
-        with _singleton_lock:
-            if _db_singleton is None:
-                _db_singleton = super(Database, cls).__new__(cls)
-        return _db_singleton
-
-    def __init__(self, db_path: Optional[str] = None, timeout: Optional[int] = None):
-        if getattr(self, "_initialized", False):
-            return
-        self._initialized = True
-
-        cfg = None
-        try:
-            cfg = get_config()
-        except Exception:
-            cfg = None
-
-        if db_path is None:
-            try:
-                db_path = get_db_path() if callable(get_db_path) else "./rquest.db"
-            except Exception:
-                db_path = "./rquest.db"
-        if timeout is None:
-            try:
-                timeout = getattr(cfg, "db", {}).get("timeout", DEFAULT_DB_TIMEOUT) if cfg else DEFAULT_DB_TIMEOUT
-                # if pydantic/dataclass style, try attribute access
-                if hasattr(cfg, "db") and not isinstance(timeout, int):
-                    timeout = getattr(cfg.db, "timeout", DEFAULT_DB_TIMEOUT)
-            except Exception:
-                timeout = DEFAULT_DB_TIMEOUT
-
-        self.db_path = os.path.abspath(db_path)
-        self.timeout = int(timeout or DEFAULT_DB_TIMEOUT)
-        self._conn_lock = threading.RLock()
+# -----------------------
+# DB class
+# -----------------------
+class DB:
+    def __init__(self, path: str = DB_PATH, timeout: float = DB_TIMEOUT):
+        self.path = path
+        self.timeout = float(timeout)
+        self._lock = threading.RLock()
         self._conn: Optional[sqlite3.Connection] = None
-        self._listeners: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {}
-        self._listener_lock = threading.RLock()
-        self._migration_lock = threading.RLock()
+        self._listeners: Dict[str, List[Callable[[Dict[str,Any]], None]]] = {}
+        self._connect()
+        self._apply_pragmas()
+        self._apply_migrations()
 
-        # internal cache for config keys
-        self._config_cache: Dict[str, Any] = {}
-
-        # For shard heartbeat management
-        self._shard_heartbeat_interval = 10  # seconds
-        self._shard_ttl = 30  # seconds (if no heartbeat for > ttl consider shard dead)
-
-        # connect and migrate
-        try:
-            self.connect()
-        except Exception as e:
-            logger.exception(f"DB connect failed ({e})")
-            raise
-
-    # -------------------------
-    # Connection management
-    # -------------------------
-    def connect(self):
-        """Open SQLite connection and ensure schema/migrations."""
-        with self._conn_lock:
-            if self._conn:
-                return
-            # Ensure directory exists
-            d = os.path.dirname(self.db_path)
-            if d and not os.path.exists(d):
-                try:
-                    os.makedirs(d, exist_ok=True)
-                except Exception:
-                    pass
-            # open connection
+    def _connect(self):
+        with self._lock:
+            need_init = not os.path.exists(self.path)
             try:
-                self._conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False, detect_types=sqlite3.PARSE_DECLTYPES)
+                self._conn = sqlite3.connect(self.path, timeout=self.timeout, check_same_thread=False)
                 self._conn.row_factory = sqlite3.Row
-                # enable WAL mode for better concurrency
-                try:
-                    self._conn.execute("PRAGMA journal_mode=WAL;")
-                except Exception:
-                    pass
-                logger.info(f"Connected to DB: {self.db_path}")
-            except sqlite3.DatabaseError as e:
-                # Try backup & recreate if DB corrupted
-                logger.exception("Database error on connect, attempting backup and recreate.")
-                try:
-                    bak = f"{self.db_path}.bak.{int(time.time())}"
-                    os.rename(self.db_path, bak)
-                    logger.warning(f"Moved corrupted DB to {bak}")
-                except Exception:
-                    logger.exception("Failed to move corrupted DB file.")
-                # retry create
-                self._conn = sqlite3.connect(self.db_path, timeout=self.timeout, check_same_thread=False, detect_types=sqlite3.PARSE_DECLTYPES)
-                self._conn.row_factory = sqlite3.Row
-            # run migrations
-            self._ensure_migrations()
+                logger.info("DB connected: %s", self.path)
+            except Exception as e:
+                logger.exception("Failed to connect to DB %s: %s", self.path, e)
+                raise
 
-    def close(self):
-        with self._conn_lock:
-            if self._conn:
-                try:
-                    self._conn.close()
-                    logger.info("Database connection closed")
-                except Exception:
-                    logger.exception("Error closing DB")
-                finally:
-                    self._conn = None
-
-    # -------------------------
-    # Transaction helpers
-    # -------------------------
-    @contextmanager
-    def transaction(self):
-        """
-        Context manager for transactions. Commits if block succeeds, rollback on exception.
-        Usage:
-            with db.transaction():
-                db.execute(...)
-        """
-        if self._conn is None:
-            self.connect()
-        cur = self._conn.cursor()
-        try:
-            cur.execute("BEGIN;")
-            yield
-            self._conn.commit()
-        except Exception:
-            try:
-                self._conn.rollback()
-            except Exception:
-                pass
-            logger.exception("Transaction failed and was rolled back.")
-            raise
-        finally:
-            cur.close()
-
-    def execute(self, sql: str, params: Tuple = (), commit: bool = False) -> sqlite3.Cursor:
-        """Execute a SQL statement with optional commit."""
-        if self._conn is None:
-            self.connect()
+    def _apply_pragmas(self):
         try:
             cur = self._conn.cursor()
-            cur.execute(sql, params)
-            if commit:
-                self._conn.commit()
-            return cur
+            cur.execute(f"PRAGMA journal_mode = {DB_JOURNAL};")
+            cur.execute(f"PRAGMA synchronous = {DB_SYNC};")
+            cur.close()
+            logger.debug("Applied DB pragmas: journal=%s synchronous=%s", DB_JOURNAL, DB_SYNC)
         except Exception:
-            logger.exception("SQL execution error: %s -- params=%s", sql, params)
-            raise
+            logger.exception("Failed applying DB pragmas")
 
-    def fetchone(self, sql: str, params: Tuple = ()) -> Optional[sqlite3.Row]:
+    # -----------------------
+    # low-level execute / fetch
+    # -----------------------
+    def execute(self, sql: str, params: tuple = (), commit: bool = False) -> sqlite3.Cursor:
+        with self._lock:
+            cur = self._conn.cursor()
+            try:
+                cur.execute(sql, params)
+                if commit:
+                    self._conn.commit()
+                return cur
+            except Exception:
+                self._conn.rollback()
+                logger.exception("SQL execute failed: %s -- params=%s", sql, params)
+                raise
+
+    def fetchone(self, sql: str, params: tuple = ()) -> Optional[Dict[str, Any]]:
         cur = self.execute(sql, params)
         row = cur.fetchone()
-        cur.close()
-        return row
-
-    def fetchall(self, sql: str, params: Tuple = ()) -> List[sqlite3.Row]:
-        cur = self.execute(sql, params)
-        rows = cur.fetchall()
-        cur.close()
-        return rows
-
-    # -------------------------
-    # Migrations
-    # -------------------------
-    def _ensure_migrations(self):
-        """
-        Ensure meta table exists and migrations up to DEFAULT_SCHEMA_VERSION are applied.
-        Future: extend migrations array and run incrementally.
-        """
-        with self._migration_lock:
-            # create meta table if not exists
-            self.execute("""
-                CREATE TABLE IF NOT EXISTS meta (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
-            """, (), commit=True)
-            # read schema version
-            row = self.fetchone("SELECT value FROM meta WHERE key = 'schema_version';")
-            current = int(row["value"]) if row and row["value"] else 0
-            logger.debug(f"Current DB schema version: {current}")
-            migrations = self._migrations()
-            # apply migrations in order
-            for ver, fn in sorted(migrations.items()):
-                if ver > current:
-                    logger.info(f"Applying migration {ver}")
-                    try:
-                        with self.transaction():
-                            fn(self)
-                            # update meta
-                            self.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?);", ("schema_version", str(ver)), commit=False)
-                        logger.info(f"Migration {ver} applied")
-                        current = ver
-                    except Exception:
-                        logger.exception(f"Failed to apply migration {ver}")
-                        raise
-
-    def _migrations(self) -> Dict[int, Callable[['Database'], None]]:
-        """
-        Return a dict of migration functions keyed by target version.
-        Add new migrations here to evolve schema.
-        """
-        migrations: Dict[int, Callable[['Database'], None]] = {}
-
-        def mig_1(db: 'Database'):
-            # initial schema: packages, dependencies, history, builds, shards, events, users, locks, configs
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS packages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    version TEXT,
-                    release INTEGER,
-                    arch TEXT,
-                    build_date INTEGER,
-                    status TEXT,
-                    UNIQUE(name)
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_packages_name ON packages(name);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS dependencies (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    package_name TEXT NOT NULL,
-                    depends_on TEXT NOT NULL,
-                    type TEXT DEFAULT 'runtime'
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_deps_pkg ON dependencies(package_name);", (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_deps_dep ON dependencies(depends_on);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    package_name TEXT,
-                    action TEXT,
-                    message TEXT,
-                    user TEXT,
-                    timestamp INTEGER DEFAULT (strftime('%s','now'))
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_history_pkg ON history(package_name);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS shards (
-                    shard_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT,
-                    worker TEXT,
-                    active INTEGER DEFAULT 1,
-                    last_heartbeat INTEGER
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_shards_worker ON shards(worker);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS builds (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    package_name TEXT,
-                    version TEXT,
-                    status TEXT, -- building, success, fail
-                    shard_id INTEGER,
-                    log_path TEXT,
-                    started_at INTEGER,
-                    finished_at INTEGER,
-                    FOREIGN KEY(shard_id) REFERENCES shards(shard_id)
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_builds_pkg ON builds(package_name);", (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_builds_status ON builds(status);", (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_builds_shard ON builds(shard_id);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS events (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    event_type TEXT,
-                    context TEXT, -- JSON
-                    timestamp INTEGER DEFAULT (strftime('%s','now'))
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT UNIQUE,
-                    role TEXT,
-                    last_action INTEGER
-                );
-            """, (), commit=False)
-            db.execute("CREATE INDEX IF NOT EXISTS idx_users_name ON users(name);", (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS locks (
-                    resource TEXT PRIMARY KEY,
-                    owner TEXT,
-                    expires_at INTEGER
-                );
-            """, (), commit=False)
-
-            db.execute("""
-                CREATE TABLE IF NOT EXISTS configs (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                );
-            """, (), commit=False)
-
-        migrations[1] = mig_1
-        # future migrations: migrations[2] = mig_2, etc.
-        return migrations
-
-    # -------------------------
-    # Event listeners
-    # -------------------------
-    def on(self, event_name: str, callback: Callable[[Dict[str, Any]], None]):
-        """Register a callback for an event. Callback receives a dict context."""
-        with self._listener_lock:
-            self._listeners.setdefault(event_name, []).append(callback)
-        logger.debug(f"Listener registered for event '{event_name}'")
-
-    def _emit(self, event_name: str, context: Dict[str, Any]):
-        """Emit event to DB (persist) and dispatch callbacks asynchronously."""
-        try:
-            # persist event
-            self.execute("INSERT INTO events (event_type, context, timestamp) VALUES (?, ?, strftime('%s','now'))", (event_name, json.dumps(context)), commit=True)
-        except Exception:
-            logger.exception("Failed to persist event to DB")
-
-        with self._listener_lock:
-            callbacks = list(self._listeners.get(event_name, []))
-        # dispatch in threads to not block core flow
-        for cb in callbacks:
-            try:
-                t = threading.Thread(target=self._safe_call, args=(cb, context), daemon=True)
-                t.start()
-            except Exception:
-                logger.exception("Failed to start listener thread")
-
-    def _safe_call(self, cb: Callable[[Dict[str, Any]], None], context: Dict[str, Any]):
-        try:
-            cb(context)
-        except Exception:
-            logger.exception("Listener raised exception")
-
-    # -------------------------
-    # High-level API: packages
-    # -------------------------
-    def add_package(self, name: str, version: Optional[str] = None, release: Optional[int] = None,
-                    arch: Optional[str] = None, status: str = "installed", user: str = "system"):
-        now = _now_ts()
-        try:
-            with self.transaction():
-                # upsert package
-                self.execute("""
-                    INSERT INTO packages (name, version, release, arch, build_date, status)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(name) DO UPDATE SET
-                        version=excluded.version,
-                        release=excluded.release,
-                        arch=excluded.arch,
-                        build_date=excluded.build_date,
-                        status=excluded.status;
-                """, (name, version, release, arch, now, status), commit=False)
-                # record history and event
-                self.add_history(name, "add", f"package added/updated status={status}", user=user)
-                self._emit("package_added", {"package": name, "version": version, "status": status, "user": user, "ts": now})
-                logger.info(f"Package added/updated: {name} ({version})")
-        except Exception:
-            logger.exception("Failed to add package")
-            raise
-
-    def update_package(self, name: str, version: Optional[str] = None, release: Optional[int] = None,
-                       status: Optional[str] = None, user: str = "system"):
-        try:
-            with self.transaction():
-                # build SET clause dynamically
-                sets = []
-                params: List[Any] = []
-                if version is not None:
-                    sets.append("version = ?")
-                    params.append(version)
-                if release is not None:
-                    sets.append("release = ?")
-                    params.append(release)
-                if status is not None:
-                    sets.append("status = ?")
-                    params.append(status)
-                if not sets:
-                    return
-                params.append(name)
-                sql = f"UPDATE packages SET {', '.join(sets)} WHERE name = ?"
-                self.execute(sql, tuple(params), commit=False)
-                self.add_history(name, "update", f"updated fields: {', '.join(sets)}", user=user)
-                self._emit("package_updated", {"package": name, "fields": sets, "user": user})
-                logger.info(f"Package updated: {name}")
-        except Exception:
-            logger.exception("Failed to update package")
-            raise
-
-    def remove_package(self, name: str, user: str = "system"):
-        try:
-            with self.transaction():
-                self.execute("DELETE FROM packages WHERE name = ?", (name,), commit=False)
-                self.add_history(name, "remove", "package removed", user=user)
-                self._emit("package_removed", {"package": name, "user": user})
-                logger.info(f"Package removed: {name}")
-        except Exception:
-            logger.exception("Failed to remove package")
-            raise
-
-    def get_package(self, name: str) -> Optional[Dict[str, Any]]:
-        row = self.fetchone("SELECT * FROM packages WHERE name = ?", (name,))
         if not row:
             return None
         return dict(row)
 
-    def list_packages(self, status: Optional[str] = None, arch: Optional[str] = None, regex: Optional[str] = None) -> List[Dict[str, Any]]:
-        sql = "SELECT * FROM packages"
-        clauses = []
-        params: List[Any] = []
-        if status:
-            clauses.append("status = ?")
-            params.append(status)
-        if arch:
-            clauses.append("arch = ?")
-            params.append(arch)
-        if regex:
-            clauses.append("name LIKE ?")
-            params.append(f"%{regex}%")
-        if clauses:
-            sql += " WHERE " + " AND ".join(clauses)
-        rows = self.fetchall(sql, tuple(params))
+    def fetchall(self, sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
+        cur = self.execute(sql, params)
+        rows = cur.fetchall()
         return [dict(r) for r in rows]
 
-    def search_packages(self, pattern: str) -> List[Dict[str, Any]]:
-        rows = self.fetchall("SELECT * FROM packages WHERE name LIKE ?", (f"%{pattern}%",))
-        return [dict(r) for r in rows]
-
-    # -------------------------
-    # Dependencies API
-    # -------------------------
-    def add_dependency(self, pkg_name: str, depends_on: str, dep_type: str = "runtime"):
-        try:
-            with self.transaction():
-                self.execute("INSERT INTO dependencies (package_name, depends_on, type) VALUES (?, ?, ?);", (pkg_name, depends_on, dep_type), commit=False)
-                self.add_history(pkg_name, "add_dependency", f"{pkg_name} -> {depends_on} ({dep_type})")
-                self._emit("dependency_added", {"package": pkg_name, "depends_on": depends_on, "type": dep_type})
-                logger.info(f"Dependency added: {pkg_name} -> {depends_on}")
-        except Exception:
-            logger.exception("Failed to add dependency")
-            raise
-
-    def get_dependencies(self, pkg_name: str) -> List[Dict[str, Any]]:
-        rows = self.fetchall("SELECT depends_on, type FROM dependencies WHERE package_name = ?", (pkg_name,))
-        return [dict(r) for r in rows]
-
-    def get_reverse_dependencies(self, pkg_name: str) -> List[Dict[str, Any]]:
-        rows = self.fetchall("SELECT package_name, type FROM dependencies WHERE depends_on = ?", (pkg_name,))
-        return [dict(r) for r in rows]
-
-    # -------------------------
-    # History & Events
-    # -------------------------
-    def add_history(self, package_name: str, action: str, message: str, user: str = "system"):
-        try:
-            self.execute("INSERT INTO history (package_name, action, message, user, timestamp) VALUES (?, ?, ?, ?, strftime('%s','now'))", (package_name, action, message, user), commit=True)
-        except Exception:
-            logger.exception("Failed to add history")
-
-    def get_history(self, limit: int = 50) -> List[Dict[str, Any]]:
-        rows = self.fetchall("SELECT * FROM history ORDER BY timestamp DESC LIMIT ?", (limit,))
-        return [dict(r) for r in rows]
-
-    def emit_event(self, event_type: str, context: Dict[str, Any]):
-        self._emit(event_type, context)
-
-    def get_events(self, event_type: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
-        if event_type:
-            rows = self.fetchall("SELECT * FROM events WHERE event_type = ? ORDER BY timestamp DESC LIMIT ?", (event_type, limit))
-        else:
-            rows = self.fetchall("SELECT * FROM events ORDER BY timestamp DESC LIMIT ?", (limit,))
-        out = []
-        for r in rows:
-            ctx = {}
+    @contextmanager
+    def transaction(self):
+        with self._lock:
             try:
-                ctx = json.loads(r["context"]) if r["context"] else {}
+                cur = self._conn.cursor()
+                cur.execute("BEGIN")
+                yield
+                self._conn.commit()
             except Exception:
-                ctx = {"raw": r["context"]}
-            out.append({"id": r["id"], "event_type": r["event_type"], "context": ctx, "timestamp": r["timestamp"]})
-        return out
-
-    # -------------------------
-    # Users API
-    # -------------------------
-    def add_user(self, name: str, role: str = "viewer"):
-        try:
-            with self.transaction():
-                self.execute("INSERT OR IGNORE INTO users (name, role, last_action) VALUES (?, ?, ?);", (name, role, _now_ts()), commit=False)
-                self.execute("UPDATE users SET role = ? WHERE name = ?;", (role, name), commit=False)
-            logger.info(f"User ensured: {name} (role={role})")
-        except Exception:
-            logger.exception("Failed to add/set user")
-            raise
-
-    def get_user(self, name: str) -> Optional[Dict[str, Any]]:
-        row = self.fetchone("SELECT * FROM users WHERE name = ?", (name,))
-        return dict(row) if row else None
-
-    def set_user_role(self, name: str, role: str):
-        try:
-            with self.transaction():
-                self.execute("UPDATE users SET role = ? WHERE name = ?;", (role, name), commit=False)
-            logger.info(f"User {name} role set to {role}")
-        except Exception:
-            logger.exception("Failed to set user role")
-            raise
-
-    # -------------------------
-    # Locks API (simple lease locks)
-    # -------------------------
-    def acquire_lock(self, resource: str, owner: str, timeout: int = 60) -> bool:
-        expires = _now_ts() + int(timeout)
-        try:
-            with self.transaction():
-                # if exists and not expired, fail
-                row = self.fetchone("SELECT owner, expires_at FROM locks WHERE resource = ?", (resource,))
-                if row:
-                    if row["expires_at"] and int(row["expires_at"]) > _now_ts():
-                        # locked
-                        return False
-                # insert or replace
-                self.execute("INSERT OR REPLACE INTO locks (resource, owner, expires_at) VALUES (?, ?, ?)", (resource, owner, expires), commit=False)
-            logger.debug(f"Lock acquired: {resource} by {owner} until {expires}")
-            return True
-        except Exception:
-            logger.exception("Failed to acquire lock")
-            return False
-
-    def release_lock(self, resource: str, owner: str) -> bool:
-        try:
-            with self.transaction():
-                row = self.fetchone("SELECT owner FROM locks WHERE resource = ?", (resource,))
-                if not row:
-                    return True
-                if row["owner"] != owner:
-                    logger.warning("Lock release attempted by non-owner")
-                    return False
-                self.execute("DELETE FROM locks WHERE resource = ?", (resource,), commit=False)
-            logger.debug(f"Lock released: {resource} by {owner}")
-            return True
-        except Exception:
-            logger.exception("Failed to release lock")
-            return False
-
-    def check_lock(self, resource: str) -> Optional[Dict[str, Any]]:
-        row = self.fetchone("SELECT * FROM locks WHERE resource = ?", (resource,))
-        return dict(row) if row else None
-
-    # -------------------------
-    # Config cache
-    # -------------------------
-    def cache_config(self, key: str, value: Any):
-        try:
-            v = json.dumps(value)
-            with self.transaction():
-                self.execute("INSERT OR REPLACE INTO configs (key, value) VALUES (?, ?);", (key, v), commit=False)
-            self._config_cache[key] = value
-            logger.debug(f"Config cached: {key}")
-        except Exception:
-            logger.exception("Failed to cache config")
-
-    def get_cached_config(self, key: str) -> Optional[Any]:
-        if key in self._config_cache:
-            return self._config_cache[key]
-        row = self.fetchone("SELECT value FROM configs WHERE key = ?", (key,))
-        if not row:
-            return None
-        try:
-            v = json.loads(row["value"])
-            self._config_cache[key] = v
-            return v
-        except Exception:
-            return row["value"]
-
-    # -------------------------
-    # Builds & Sharding
-    # -------------------------
-    def register_shard(self, name: str, worker: str) -> int:
-        """
-        Register a shard (worker). Returns shard_id.
-        If worker already has a shard, update heartbeat and return existing.
-        """
-        now = _now_ts()
-        try:
-            with self.transaction():
-                row = self.fetchone("SELECT shard_id FROM shards WHERE worker = ?", (worker,))
-                if row:
-                    shard_id = int(row["shard_id"])
-                    self.execute("UPDATE shards SET last_heartbeat = ?, active = 1 WHERE shard_id = ?", (now, shard_id), commit=False)
-                    return shard_id
-                else:
-                    cur = self.execute("INSERT INTO shards (name, worker, active, last_heartbeat) VALUES (?, ?, 1, ?);", (name, worker, now), commit=True)
-                    # sqlite3.Cursor.lastrowid for last insert id
-                    shard_id = cur.lastrowid
-                    logger.info(f"Shard registered: id={shard_id} worker={worker}")
-                    return shard_id
-        except Exception:
-            logger.exception("Failed to register shard")
-            raise
-
-    def heartbeat_shard(self, shard_id: int):
-        now = _now_ts()
-        try:
-            self.execute("UPDATE shards SET last_heartbeat = ?, active = 1 WHERE shard_id = ?", (now, shard_id), commit=True)
-        except Exception:
-            logger.exception("Failed to heartbeat shard")
-
-    def list_shards(self) -> List[Dict[str, Any]]:
-        rows = self.fetchall("SELECT * FROM shards")
-        return [dict(r) for r in rows]
-
-    def _prune_dead_shards(self):
-        """Mark shards with heartbeat older than ttl as inactive."""
-        cutoff = _now_ts() - self._shard_ttl
-        try:
-            self.execute("UPDATE shards SET active = 0 WHERE last_heartbeat IS NOT NULL AND last_heartbeat < ?", (cutoff,), commit=True)
-        except Exception:
-            logger.exception("Failed to prune dead shards")
-
-    def acquire_shard_for_build(self, preferred_shard: Optional[int] = None) -> Optional[int]:
-        """
-        Acquire a shard id for a new build. Strategy:
-         - prune dead shards
-         - if preferred_shard provided and active, return it
-         - else choose shard with least 'building' builds
-         - else create new shard up to max_shards (from config)
-        Note: registering a new shard normally happens from worker side via register_shard; this
-        function assumes shards already exist, but will fallback to create a "local" shard entry.
-        """
-        self._prune_dead_shards()
-        try:
-            # If preferred shard specified and active
-            if preferred_shard:
-                row = self.fetchone("SELECT active FROM shards WHERE shard_id = ?", (preferred_shard,))
-                if row and int(row["active"]) == 1:
-                    return preferred_shard
-            # count building builds per shard
-            rows = self.fetchall("""
-                SELECT s.shard_id, COUNT(b.id) as building_count
-                FROM shards s
-                LEFT JOIN builds b ON b.shard_id = s.shard_id AND b.status = 'building'
-                WHERE s.active = 1
-                GROUP BY s.shard_id
-                ORDER BY building_count ASC, s.shard_id ASC
-            """)
-            if rows:
-                # choose first (least loaded)
-                return int(rows[0]["shard_id"])
-            # no active shards: create a local shard entry (name=local)
-            max_shards = DEFAULT_MAX_SHARDS
-            try:
-                bs_cfg = get_buildsystem_config() if callable(get_buildsystem_config) else {}
-                if isinstance(bs_cfg, dict):
-                    max_shards = int(bs_cfg.get("max_shards", max_shards))
-                else:
-                    max_shards = int(getattr(bs_cfg, "max_shards", max_shards))
-            except Exception:
-                pass
-            total = self.fetchone("SELECT COUNT(*) as c FROM shards")
-            total_num = int(total["c"]) if total else 0
-            if total_num < max_shards:
-                # create a new shard record (worker unknown)
-                cur = self.execute("INSERT INTO shards (name, worker, active, last_heartbeat) VALUES (?, ?, 1, ?)", ("auto", None, _now_ts()), commit=True)
-                return cur.lastrowid
-            # otherwise fallback to first shard id
-            r2 = self.fetchone("SELECT shard_id FROM shards LIMIT 1")
-            return int(r2["shard_id"]) if r2 else None
-        except Exception:
-            logger.exception("Failed to acquire shard for build")
-            return None
-
-    def start_build(self, package_name: str, version: Optional[str] = None, shard_id: Optional[int] = None, user: str = "builder") -> int:
-        """
-        Create a build row with status 'building'. If shard_id not provided, attempt to acquire one.
-        Returns build_id.
-        """
-        try:
-            if shard_id is None:
-                shard_id = self.acquire_shard_for_build()
-            now = _now_ts()
-            with self.transaction():
-                cur = self.execute("INSERT INTO builds (package_name, version, status, shard_id, started_at) VALUES (?, ?, 'building', ?, ?)", (package_name, version, shard_id, now), commit=False)
-                build_id = cur.lastrowid
-                self.add_history(package_name, "build_start", f"build_id={build_id} shard={shard_id}", user=user)
-                self._emit("build_started", {"package": package_name, "build_id": build_id, "shard": shard_id, "user": user})
-                logger.info(f"Build started: id={build_id} pkg={package_name} shard={shard_id}")
-                return build_id
-        except Exception:
-            logger.exception("Failed to start build")
-            raise
-
-    def finish_build(self, build_id: int, status: str = "success", log_path: Optional[str] = None, user: str = "builder"):
-        """
-        Mark build finished with status (success/fail). Update finished_at, log_path.
-        """
-        try:
-            now = _now_ts()
-            with self.transaction():
-                self.execute("UPDATE builds SET status = ?, finished_at = ?, log_path = ? WHERE id = ?", (status, now, log_path, build_id), commit=False)
-                row = self.fetchone("SELECT package_name FROM builds WHERE id = ?", (build_id,))
-                pkg = row["package_name"] if row else "<unknown>"
-                self.add_history(pkg, "build_finish", f"build_id={build_id} status={status} log={log_path}", user=user)
-                self._emit("build_finished", {"package": pkg, "build_id": build_id, "status": status, "log": log_path, "user": user})
-                logger.info(f"Build finished: id={build_id} pkg={pkg} status={status}")
-        except Exception:
-            logger.exception("Failed to finish build")
-            raise
-
-    def get_builds(self, package_name: Optional[str] = None, limit: int = 10) -> List[Dict[str, Any]]:
-        if package_name:
-            rows = self.fetchall("SELECT * FROM builds WHERE package_name = ? ORDER BY started_at DESC LIMIT ?", (package_name, limit))
-        else:
-            rows = self.fetchall("SELECT * FROM builds ORDER BY started_at DESC LIMIT ?", (limit,))
-        return [dict(r) for r in rows]
-
-    # -------------------------
-    # Export / Import
-    # -------------------------
-    def export_db(self, path: str):
-        """
-        Export DB tables to JSON file (dictionary of tables -> list of rows)
-        """
-        try:
-            tables = ["packages", "dependencies", "history", "builds", "shards", "events", "users", "locks", "configs"]
-            out = {}
-            for t in tables:
-                rows = self.fetchall(f"SELECT * FROM {t}")
-                out[t] = [dict(r) for r in rows]
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(out, f, ensure_ascii=False, indent=2)
-            logger.info(f"DB exported to {path}")
-        except Exception:
-            logger.exception("Failed to export DB")
-            raise
-
-    def import_db(self, path: str, replace: bool = False):
-        """
-        Import DB from file exported by export_db.
-        If replace=True, clear existing tables first.
-        """
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            with self.transaction():
-                if replace:
-                    for t in data.keys():
-                        self.execute(f"DELETE FROM {t};", (), commit=False)
-                for t, rows in data.items():
-                    if not rows:
-                        continue
-                    # prepare insert columns from first row keys
-                    cols = list(rows[0].keys())
-                    placeholders = ", ".join(["?"] * len(cols))
-                    colnames = ", ".join(cols)
-                    for r in rows:
-                        vals = tuple(r.get(c) for c in cols)
-                        self.execute(f"INSERT INTO {t} ({colnames}) VALUES ({placeholders});", vals, commit=False)
-            logger.info(f"DB imported from {path}")
-        except Exception:
-            logger.exception("Failed to import DB")
-            raise
-
-    # -------------------------
-    # Utility & cleanup
-    # -------------------------
-    def vacuum(self):
-        try:
-            self.execute("VACUUM;", (), commit=True)
-            logger.info("Database vacuumed")
-        except Exception:
-            logger.exception("Vacuum failed")
-
-    def backup(self, path: str):
-        try:
-            # sqlite backup API
-            if self._conn:
-                dest = sqlite3.connect(path)
-                with dest:
-                    self._conn.backup(dest)
-                dest.close()
-                logger.info(f"Database backed up to {path}")
-        except Exception:
-            logger.exception("Backup failed")
-            raise
-
-# ---------------------------------------------------------------------------
-# Module-level convenience
-# ---------------------------------------------------------------------------
-
-_db_instance: Optional[Database] = None
-_db_instance_lock = threading.RLock()
-
-def get_db() -> Database:
-    global _db_instance
-    with _db_instance_lock:
-        if _db_instance is None:
-            # Determine path and timeout from config if available
-            try:
-                cfg = get_config()
-                dbpath = None
-                timeout = None
+                self._conn.rollback()
+                logger.exception("Transaction failed, rolled back")
+                raise
+            finally:
                 try:
-                    # dataclass/pydantic may have attributes
-                    db_section = getattr(cfg, "db", None)
-                    if db_section:
-                        if isinstance(db_section, dict):
-                            dbpath = db_section.get("path")
-                            timeout = db_section.get("timeout")
-                        else:
-                            dbpath = getattr(db_section, "path", None)
-                            timeout = getattr(db_section, "timeout", None)
+                    cur.close()
                 except Exception:
                     pass
-                _db_instance = Database(db_path=dbpath, timeout=timeout)
+
+    # -----------------------
+    # schema / migrations
+    # -----------------------
+    def _apply_migrations(self):
+        """
+        Basic migrations. We keep a simple version in 'meta' table.
+        v1: initial schema with packages, installed_packages, builds, toolchains, toolchain_history, events, shards
+        Future migrations: add columns, indexes.
+        """
+        try:
+            self.execute("""
+                CREATE TABLE IF NOT EXISTS meta (
+                  key TEXT PRIMARY KEY,
+                  value TEXT
+                );
+            """, commit=True)
+
+            ver = self._get_schema_version()
+            if ver is None:
+                ver = 0
+
+            if ver < 1:
+                logger.info("Applying DB migration v1 (initial schema)")
+                with self.transaction():
+                    # packages - repository recipes and metadata
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS packages (
+                          name TEXT PRIMARY KEY,
+                          version TEXT,
+                          category TEXT,
+                          summary TEXT,
+                          meta_path TEXT,
+                          metadata JSON,
+                          added_at INTEGER
+                        );
+                    """)
+                    # installed packages - what is currently installed
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS installed_packages (
+                          name TEXT PRIMARY KEY,
+                          version TEXT,
+                          meta_path TEXT,
+                          files TEXT,
+                          installed_at INTEGER
+                        );
+                    """)
+                    # builds - build history and details
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS builds (
+                          id TEXT PRIMARY KEY,
+                          pkg TEXT,
+                          version TEXT,
+                          started_at INTEGER,
+                          finished_at INTEGER,
+                          ok INTEGER,
+                          stage TEXT,
+                          detail TEXT
+                        );
+                    """)
+                    # toolchains registry
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS toolchains (
+                          id TEXT PRIMARY KEY,
+                          name TEXT UNIQUE,
+                          path TEXT,
+                          profile TEXT,
+                          created_at INTEGER
+                        );
+                    """)
+                    # toolchain history
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS toolchain_history (
+                          id TEXT PRIMARY KEY,
+                          toolchain_name TEXT,
+                          stage TEXT,
+                          meta TEXT,
+                          ok INTEGER,
+                          ts INTEGER,
+                          detail TEXT
+                        );
+                    """)
+                    # events (auditable)
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS events (
+                          id TEXT PRIMARY KEY,
+                          name TEXT,
+                          payload TEXT,
+                          ts INTEGER
+                        );
+                    """)
+                    # shards / build workers
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS shards (
+                          id TEXT PRIMARY KEY,
+                          name TEXT,
+                          last_heartbeat INTEGER,
+                          metadata TEXT
+                        );
+                    """)
+                    # locks
+                    self.execute("""
+                        CREATE TABLE IF NOT EXISTS locks (
+                          name TEXT PRIMARY KEY,
+                          owner TEXT,
+                          ts INTEGER
+                        );
+                    """)
+                    # upgrade schema version
+                    self._set_schema_version(1)
+                ver = 1
+                logger.info("DB migration v1 applied")
+            # future migrations here...
+        except Exception:
+            logger.exception("Failed applying migrations")
+
+    def _get_schema_version(self) -> Optional[int]:
+        try:
+            row = self.fetchone("SELECT value FROM meta WHERE key = 'schema_version'")
+            if row and row.get("value"):
+                return int(row["value"])
+        except Exception:
+            pass
+        return None
+
+    def _set_schema_version(self, v: int):
+        try:
+            self.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('schema_version', ?)", (str(int(v)),), commit=True)
+        except Exception:
+            logger.exception("Failed setting schema_version")
+
+    # -----------------------
+    # high-level helpers: packages
+    # -----------------------
+    def add_package(self, name: str, version: str, meta_path: str, category: Optional[str] = None, summary: Optional[str] = None, metadata: Optional[Dict[str,Any]] = None):
+        metadata_json = _to_json_safe(metadata or {})
+        now = _now_ts()
+        try:
+            self.execute("""
+                INSERT OR REPLACE INTO packages (name, version, category, summary, meta_path, metadata, added_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, version, category, summary, meta_path, metadata_json, now), commit=True)
+            logger.debug("Package recorded: %s-%s", name, version)
+        except Exception:
+            logger.exception("add_package failed for %s", name)
+            raise
+
+    def get_package(self, name: str) -> Optional[Dict[str,Any]]:
+        row = self.fetchone("SELECT * FROM packages WHERE name = ?", (name,))
+        if not row:
+            return None
+        # deserialize metadata
+        row["metadata"] = _from_json_safe(row.get("metadata"))
+        return row
+
+    def list_packages(self) -> List[Dict[str,Any]]:
+        rows = self.fetchall("SELECT * FROM packages ORDER BY name")
+        for r in rows:
+            r["metadata"] = _from_json_safe(r.get("metadata"))
+        return rows
+
+    def remove_package(self, name: str):
+        try:
+            self.execute("DELETE FROM packages WHERE name = ?", (name,), commit=True)
+        except Exception:
+            logger.exception("remove_package failed for %s", name)
+            raise
+
+    # -----------------------
+    # installed packages (what's on disk)
+    # -----------------------
+    def add_installed_package(self, name: str, version: str, meta_path: str, files: Optional[List[str]] = None):
+        files_json = _to_json_safe(files or [])
+        now = _now_ts()
+        try:
+            self.execute("""
+                INSERT OR REPLACE INTO installed_packages (name, version, meta_path, files, installed_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (name, version, meta_path, files_json, now), commit=True)
+            logger.debug("Installed package recorded: %s-%s", name, version)
+        except Exception:
+            logger.exception("add_installed_package failed for %s", name)
+            raise
+
+    def remove_installed_package(self, name: str):
+        try:
+            self.execute("DELETE FROM installed_packages WHERE name = ?", (name,), commit=True)
+            logger.debug("Installed package removed: %s", name)
+        except Exception:
+            logger.exception("remove_installed_package failed for %s", name)
+            raise
+
+    def get_installed_package(self, name: str) -> Optional[Dict[str,Any]]:
+        r = self.fetchone("SELECT * FROM installed_packages WHERE name = ?", (name,))
+        if not r:
+            return None
+        r["files"] = _from_json_safe(r.get("files"))
+        return r
+
+    def get_installed_packages(self, order_by_deps: bool = False) -> List[Dict[str,Any]]:
+        # order_by_deps currently ignored (resolver handles ordering)
+        rows = self.fetchall("SELECT * FROM installed_packages ORDER BY name")
+        for r in rows:
+            r["files"] = _from_json_safe(r.get("files"))
+        return rows
+
+    # -----------------------
+    # builds history
+    # -----------------------
+    def record_build(self, pkg: str, version: str, ok: bool, stage: str, detail: Optional[Dict[str,Any]] = None) -> str:
+        bid = f"bld-{_uid()}"
+        now = _now_ts()
+        detail_text = _to_json_safe(detail or {})
+        try:
+            self.execute("""
+                INSERT INTO builds (id, pkg, version, started_at, finished_at, ok, stage, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (bid, pkg, version, now, now, 1 if ok else 0, stage, detail_text), commit=True)
+            logger.debug("Recorded build %s %s ok=%s", pkg, version, ok)
+            return bid
+        except Exception:
+            logger.exception("record_build failed for %s", pkg)
+            raise
+
+    def list_builds(self, limit: int = 100) -> List[Dict[str,Any]]:
+        rows = self.fetchall("SELECT * FROM builds ORDER BY finished_at DESC LIMIT ?", (limit,))
+        for r in rows:
+            r["detail"] = _from_json_safe(r.get("detail"))
+        return rows
+
+    def get_build(self, bid: str) -> Optional[Dict[str,Any]]:
+        r = self.fetchone("SELECT * FROM builds WHERE id = ?", (bid,))
+        if not r:
+            return None
+        r["detail"] = _from_json_safe(r.get("detail"))
+        return r
+
+    # -----------------------
+    # toolchains
+    # -----------------------
+    def add_toolchain(self, name: str, path: str, profile: Optional[str] = None) -> str:
+        tid = f"tc-{_uid()}"
+        now = _now_ts()
+        try:
+            self.execute("""
+                INSERT OR REPLACE INTO toolchains (id, name, path, profile, created_at)
+                VALUES (?, ?, ?, ?, ?)
+            """, (tid, name, path, profile or "", now), commit=True)
+            logger.debug("Toolchain added: %s -> %s", name, path)
+            return tid
+        except Exception:
+            logger.exception("add_toolchain failed for %s", name)
+            raise
+
+    def list_toolchains(self) -> List[Dict[str,Any]]:
+        rows = self.fetchall("SELECT * FROM toolchains ORDER BY name")
+        return rows
+
+    def get_toolchain(self, name: str) -> Optional[Dict[str,Any]]:
+        r = self.fetchone("SELECT * FROM toolchains WHERE name = ?", (name,))
+        return r
+
+    def add_toolchain_history(self, toolchain_name: str, stage: str, meta: str, ok: bool, detail: Optional[Dict[str,Any]] = None) -> str:
+        tid = f"tch-{_uid()}"
+        now = _now_ts()
+        dt = _to_json_safe(detail or {})
+        try:
+            self.execute("""
+                INSERT INTO toolchain_history (id, toolchain_name, stage, meta, ok, ts, detail)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (tid, toolchain_name, stage, meta, 1 if ok else 0, now, dt), commit=True)
+            logger.debug("Toolchain history recorded: %s %s ok=%s", toolchain_name, stage, ok)
+            return tid
+        except Exception:
+            logger.exception("add_toolchain_history failed for %s", toolchain_name)
+            raise
+
+    def list_toolchain_history(self, name: Optional[str] = None, limit: int = 200) -> List[Dict[str,Any]]:
+        if name:
+            rows = self.fetchall("SELECT * FROM toolchain_history WHERE toolchain_name = ? ORDER BY ts DESC LIMIT ?", (name, limit))
+        else:
+            rows = self.fetchall("SELECT * FROM toolchain_history ORDER BY ts DESC LIMIT ?", (limit,))
+        for r in rows:
+            r["detail"] = _from_json_safe(r.get("detail"))
+        return rows
+
+    # -----------------------
+    # events / listeners
+    # -----------------------
+    def emit_event(self, name: str, payload: Optional[Dict[str,Any]] = None) -> str:
+        eid = f"evt-{_uid()}"
+        now = _now_ts()
+        ptext = _to_json_safe(payload or {})
+        try:
+            self.execute("INSERT INTO events (id, name, payload, ts) VALUES (?, ?, ?, ?)", (eid, name, ptext, now), commit=True)
+        except Exception:
+            logger.exception("emit_event DB insert failed")
+        # notify listeners (in-thread)
+        listeners = list(self._listeners.get(name, []))
+        for cb in listeners:
+            try:
+                cb({"id": eid, "name": name, "payload": payload or {}, "ts": now})
             except Exception:
-                _db_instance = Database()
-        return _db_instance
+                logger.exception("Event listener callback failed for %s", name)
+        return eid
 
-# expose most used functions at module level
-def add_package(*a, **k): return get_db().add_package(*a, **k)
-def update_package(*a, **k): return get_db().update_package(*a, **k)
-def remove_package(*a, **k): return get_db().remove_package(*a, **k)
-def get_package(*a, **k): return get_db().get_package(*a, **k)
-def list_packages(*a, **k): return get_db().list_packages(*a, **k)
-def search_packages(*a, **k): return get_db().search_packages(*a, **k)
+    def on(self, name: str, callback: Callable[[Dict[str,Any]], None]):
+        if name not in self._listeners:
+            self._listeners[name] = []
+        self._listeners[name].append(callback)
+        logger.debug("Listener added for event %s", name)
 
-def add_dependency(*a, **k): return get_db().add_dependency(*a, **k)
-def get_dependencies(*a, **k): return get_db().get_dependencies(*a, **k)
-def get_reverse_dependencies(*a, **k): return get_db().get_reverse_dependencies(*a, **k)
+    def get_events(self, limit: int = 100) -> List[Dict[str,Any]]:
+        rows = self.fetchall("SELECT * FROM events ORDER BY ts DESC LIMIT ?", (limit,))
+        for r in rows:
+            r["payload"] = _from_json_safe(r.get("payload"))
+        return rows
 
-def add_history(*a, **k): return get_db().add_history(*a, **k)
-def get_history(*a, **k): return get_db().get_history(*a, **k)
-def emit_event(*a, **k): return get_db().emit_event(*a, **k)
-def get_events(*a, **k): return get_db().get_events(*a, **k)
+    # -----------------------
+    # locks (simple advisory)
+    # -----------------------
+    def acquire_lock(self, name: str, owner: str) -> bool:
+        now = _now_ts()
+        try:
+            self.execute("INSERT OR REPLACE INTO locks (name, owner, ts) VALUES (?, ?, ?)", (name, owner, now), commit=True)
+            return True
+        except Exception:
+            logger.debug("acquire_lock failed for %s", name)
+            return False
 
-def add_user(*a, **k): return get_db().add_user(*a, **k)
-def get_user(*a, **k): return get_db().get_user(*a, **k)
-def set_user_role(*a, **k): return get_db().set_user_role(*a, **k)
+    def release_lock(self, name: str):
+        try:
+            self.execute("DELETE FROM locks WHERE name = ?", (name,), commit=True)
+            return True
+        except Exception:
+            logger.exception("release_lock failed for %s", name)
+            return False
 
-def acquire_lock(*a, **k): return get_db().acquire_lock(*a, **k)
-def release_lock(*a, **k): return get_db().release_lock(*a, **k)
-def check_lock(*a, **k): return get_db().check_lock(*a, **k)
+    def check_lock(self, name: str) -> Optional[Dict[str,Any]]:
+        r = self.fetchone("SELECT * FROM locks WHERE name = ?", (name,))
+        return r
 
-def register_shard(*a, **k): return get_db().register_shard(*a, **k)
-def heartbeat_shard(*a, **k): return get_db().heartbeat_shard(*a, **k)
-def list_shards(*a, **k): return get_db().list_shards(*a, **k)
-def acquire_shard_for_build(*a, **k): return get_db().acquire_shard_for_build(*a, **k)
+    # -----------------------
+    # shards - basic registry for build workers
+    # -----------------------
+    def register_shard(self, shard_id: str, name: str, metadata: Optional[Dict[str,Any]] = None) -> bool:
+        now = _now_ts()
+        meta_text = _to_json_safe(metadata or {})
+        try:
+            self.execute("INSERT OR REPLACE INTO shards (id, name, last_heartbeat, metadata) VALUES (?, ?, ?, ?)",
+                         (shard_id, name, now, meta_text), commit=True)
+            return True
+        except Exception:
+            logger.exception("register_shard failed for %s", shard_id)
+            return False
 
-def start_build(*a, **k): return get_db().start_build(*a, **k)
-def finish_build(*a, **k): return get_db().finish_build(*a, **k)
-def get_builds(*a, **k): return get_db().get_builds(*a, **k)
+    def heartbeat_shard(self, shard_id: str):
+        now = _now_ts()
+        try:
+            self.execute("UPDATE shards SET last_heartbeat = ? WHERE id = ?", (now, shard_id), commit=True)
+            return True
+        except Exception:
+            logger.exception("heartbeat_shard failed for %s", shard_id)
+            return False
 
-def cache_config(*a, **k): return get_db().cache_config(*a, **k)
-def get_cached_config(*a, **k): return get_db().get_cached_config(*a, **k)
+    def list_shards(self) -> List[Dict[str,Any]]:
+        rows = self.fetchall("SELECT * FROM shards ORDER BY last_heartbeat DESC")
+        for r in rows:
+            r["metadata"] = _from_json_safe(r.get("metadata"))
+        return rows
 
-def export_db(*a, **k): return get_db().export_db(*a, **k)
-def import_db(*a, **k): return get_db().import_db(*a, **k)
-def vacuum(*a, **k): return get_db().vacuum(*a, **k)
-def backup(*a, **k): return get_db().backup(*a, **k)
+    # -----------------------
+    # utilities
+    # -----------------------
+    def backup(self, dest_path: str) -> bool:
+        try:
+            # ensure DB is synced
+            with self._lock:
+                self._conn.commit()
+                shutil.copy2(self.path, dest_path)
+            logger.info("DB backup created: %s", dest_path)
+            return True
+        except Exception:
+            logger.exception("DB backup failed")
+            return False
 
-# ---------------------------------------------------------------------------
-# If run as script, demo usage
-# ---------------------------------------------------------------------------
+    def vacuum(self) -> bool:
+        try:
+            self.execute("VACUUM;", commit=True)
+            logger.info("DB vacuum finished")
+            return True
+        except Exception:
+            logger.exception("DB vacuum failed")
+            return False
+
+    def export_json(self) -> Dict[str,Any]:
+        out: Dict[str, Any] = {}
+        out["meta"] = {"exported_at": _now_ts(), "db_path": self.path}
+        out["packages"] = self.fetchall("SELECT * FROM packages")
+        out["installed_packages"] = self.fetchall("SELECT * FROM installed_packages")
+        out["builds"] = self.fetchall("SELECT * FROM builds")
+        out["toolchains"] = self.fetchall("SELECT * FROM toolchains")
+        out["toolchain_history"] = self.fetchall("SELECT * FROM toolchain_history")
+        out["events"] = self.fetchall("SELECT * FROM events")
+        return out
+
+    def import_json(self, data: Dict[str,Any]) -> bool:
+        try:
+            with self.transaction():
+                for p in data.get("packages", []):
+                    self.execute("INSERT OR REPLACE INTO packages (name, version, category, summary, meta_path, metadata, added_at) VALUES (?,?,?,?,?,?,?)",
+                                 (p.get("name"), p.get("version"), p.get("category"), p.get("summary"), p.get("meta_path"), _to_json_safe(p.get("metadata")), p.get("added_at")))
+                for ip in data.get("installed_packages", []):
+                    self.execute("INSERT OR REPLACE INTO installed_packages (name, version, meta_path, files, installed_at) VALUES (?,?,?,?,?)",
+                                 (ip.get("name"), ip.get("version"), ip.get("meta_path"), _to_json_safe(ip.get("files")), ip.get("installed_at")))
+                for b in data.get("builds", []):
+                    self.execute("INSERT OR REPLACE INTO builds (id, pkg, version, started_at, finished_at, ok, stage, detail) VALUES (?,?,?,?,?,?,?,?)",
+                                 (b.get("id"), b.get("pkg"), b.get("version"), b.get("started_at"), b.get("finished_at"), b.get("ok"), b.get("stage"), _to_json_safe(b.get("detail"))))
+                for t in data.get("toolchains", []):
+                    self.execute("INSERT OR REPLACE INTO toolchains (id, name, path, profile, created_at) VALUES (?,?,?,?,?)",
+                                 (t.get("id"), t.get("name"), t.get("path"), t.get("profile"), t.get("created_at")))
+                for th in data.get("toolchain_history", []):
+                    self.execute("INSERT OR REPLACE INTO toolchain_history (id, toolchain_name, stage, meta, ok, ts, detail) VALUES (?,?,?,?,?,?,?)",
+                                 (th.get("id"), th.get("toolchain_name"), th.get("stage"), th.get("meta"), th.get("ok"), th.get("ts"), _to_json_safe(th.get("detail"))))
+                for e in data.get("events", []):
+                    self.execute("INSERT OR REPLACE INTO events (id, name, payload, ts) VALUES (?,?,?,?)",
+                                 (e.get("id"), e.get("name"), _to_json_safe(e.get("payload")), e.get("ts")))
+            return True
+        except Exception:
+            logger.exception("DB import failed")
+            return False
+
+    def close(self):
+        try:
+            with self._lock:
+                if self._conn:
+                    self._conn.commit()
+                    self._conn.close()
+                    self._conn = None
+                    logger.info("DB connection closed")
+        except Exception:
+            logger.exception("Failed closing DB")
+
+# -----------------------
+# Singleton accessor
+# -----------------------
+_DB_SINGLETON: Optional[DB] = None
+def get_db() -> DB:
+    global _DB_SINGLETON
+    if _DB_SINGLETON is None:
+        _DB_SINGLETON = DB()
+    return _DB_SINGLETON
+
+# -----------------------
+# Convenience module-level wrappers
+# -----------------------
+_db = get_db()
+execute = _db.execute
+fetchone = _db.fetchone
+fetchall = _db.fetchall
+transaction = _db.transaction
+add_package = _db.add_package
+get_package = _db.get_package
+list_packages = _db.list_packages
+remove_package = _db.remove_package
+add_installed_package = _db.add_installed_package
+get_installed_packages = _db.get_installed_packages
+remove_installed_package = _db.remove_installed_package
+record_build = _db.record_build
+list_builds = _db.list_builds
+get_build = _db.get_build
+add_toolchain = _db.add_toolchain
+list_toolchains = _db.list_toolchains
+add_toolchain_history = _db.add_toolchain_history
+list_toolchain_history = _db.list_toolchain_history
+emit_event = _db.emit_event
+on = _db.on
+backup = _db.backup
+vacuum = _db.vacuum
+export_json = _db.export_json
+import_json = _db.import_json
+close = _db.close
+
+# -----------------------
+# If invoked directly, print DB status
+# -----------------------
 if __name__ == "__main__":
-    db = get_db()
-    # demo: add user, package, dependency, start build, finish build, export
-    db.add_user("builder", "builder")
-    db.add_package("example-pkg", "1.2.3", 1, "x86_64", "installed", user="builder")
-    db.add_dependency("example-pkg", "libfoo >= 1.0", "runtime")
-    shard = db.register_shard("local", "worker-1")
-    build_id = db.start_build("example-pkg", "1.2.3", shard_id=shard, user="builder")
-    db.finish_build(build_id, status="success", log_path="/var/log/rquest/example-pkg-build.log", user="builder")
-    print("Packages:", db.list_packages())
-    print("Builds:", db.get_builds(limit=10))
-    db.export_db("./rquest-export.json")
-    print("Exported DB to ./rquest-export.json")
+    d = get_db()
+    print("DB path:", d.path)
+    print("Tables present:", [r["name"] for r in d.fetchall("SELECT name FROM sqlite_master WHERE type='table'")])
+    print("Packages:", d.list_packages()[:10])
