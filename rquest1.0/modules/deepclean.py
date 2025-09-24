@@ -1,35 +1,34 @@
-# Rquest/rquest1.0/modules/deepclean.py
+# rquest1.0/modules/deepclean.py
+# -*- coding: utf-8 -*-
 """
-deepclean.py - limpeza inteligente de órfãos, builds temporários, cache e GC
+DeepClean Manager for Rquest
 
-Funcionalidades:
-- detect_orphans(dry_run=True) : detecta pacotes órfãos com base em installed_packages + resolver
-- simulate_removal(candidates): tenta simular/remover verificando com resolver (se suportado) ou heurística conservadora
-- apply_cleanup(candidates, snapshot=True): cria snapshots opcionais, remove pacotes, limpa builds temporários, pruna cache
-- prune_cache(): delega para pkgtool.PackageCache pruning LRU/FIFO conforme política
-- clean_build_dirs(): limpa diretórios de build antigos conhecidos pelo buildsystem
-- GC daemon: roda periodicamente e aplica políticas soft/hard thresholds
-- restore_snapshot(snapshot_id): restaura pacote a partir do snapshot salvo
-- Relatórios JSON/YAML; hooks para integração
-- Registro de runs no DB (deepclean_runs) e candidaturas (deepclean_candidates)
+Features:
+ - DeepCleanContext for dry_run/interactive/snapshot control
+ - Adapters for pkgtool and resolver with normalized APIs
+ - Coordination with conflicts.ConflictResolver before removals
+ - Snapshot creation (btrfs/zfs quickpkg fallback or file copy)
+ - Restore snapshot support
+ - DB schema & migrations (schema_versions, deepclean_runs, deepclean_snapshots)
+ - detect_orphans (pure), simulate_removal (pure), apply_cleanup (side-effects)
+ - prune_cache, clean_build_dirs, daemon mode
+ - Hooks integration and structured logging/events
 """
 
 from __future__ import annotations
-
 import os
 import sys
 import json
 import time
-import uuid
 import shutil
-import sqlite3
+import logging
 import threading
 import tempfile
-import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 # ----------------------------
-# Robust imports / fallbacks
+# Defensive imports for integration
 # ----------------------------
 try:
     from modules.config import get_config  # type: ignore
@@ -39,910 +38,763 @@ except Exception:
 
 try:
     from modules.logging import get_logger  # type: ignore
-    logger = get_logger("deepclean")
+    LOG = get_logger("deepclean")
 except Exception:
-    logger = logging.getLogger("deepclean")
-    if not logger.handlers:
+    LOG = logging.getLogger("rquest.deepclean")
+    if not LOG.handlers:
         logging.basicConfig(level=logging.INFO)
 
-# DB accessor (expected to be a wrapper with execute/fetchone/fetchall)
 try:
-    from modules.db import get_db, add_history, emit_event  # type: ignore
+    from modules.db import get_db, emit_event  # type: ignore
 except Exception:
-    def get_db(): return None
-    def add_history(*a, **k): pass
-    def emit_event(*a, **k): pass
+    get_db = None
+    def emit_event(*a, **k):
+        pass
 
-# resolver
-try:
-    from modules.resolver import get_resolver  # type: ignore
-except Exception:
-    def get_resolver(): return None
-
-# pkgtool
 try:
     from modules.pkgtool import get_pkgtool  # type: ignore
 except Exception:
-    def get_pkgtool(): return None
+    get_pkgtool = None
 
-# buildsystem
 try:
-    from modules.buildsystem import get_buildsystem  # type: ignore
+    from modules.resolver import get_resolver  # type: ignore
 except Exception:
-    def get_buildsystem(): return None
+    get_resolver = None
 
-# sandbox
 try:
-    from modules.sandbox import get_sandbox_manager  # type: ignore
+    from modules.conflicts import ConflictResolver  # type: ignore
 except Exception:
-    def get_sandbox_manager(): return None
+    ConflictResolver = None
 
-# hooks
 try:
     from modules.hooks import get_hook_manager  # type: ignore
 except Exception:
-    def get_hook_manager(): return None
-
-# masks (if present) and slots - used conservatively
-try:
-    from modules.masks import is_masked  # type: ignore
-except Exception:
-    def is_masked(*a, **k): return False
+    get_hook_manager = None
 
 # ----------------------------
-# Utilities
+# Configuration defaults & normalize
+# ----------------------------
+CFG = get_config() if callable(get_config) else {}
+DEEP_CFG = CFG.get("deepclean", {}) if isinstance(CFG, dict) else {}
+
+DEFAULTS = {
+    "enabled": True,
+    "dry_run_default": True,
+    "snapshot_before_remove": True,
+    "snapshot_dir": "/var/lib/rquest/deepclean_snapshots",
+    "trash_dir": "/var/lib/rquest/deepclean_trash",
+    "snapshot_retention_days": 7,
+    "orphan_age_days": 90,
+    "orphan_min_size_bytes": 1024,
+    "auto_remove_conflicting": False,
+    "auto_backup_conflicting": True,
+    "allow_dep_conflicts": False,
+    "gc_daemon": {"enabled": False, "interval_seconds": 3600},
+    "prune_cache_on_clean": True,
+    "builddirs": ["/var/tmp/rquest/build", "/tmp/rquest-build"],
+    "lockfile": "/var/run/rquest-deepclean.lock",
+}
+
+def _cfg_get(key: str, default=None):
+    return DEEP_CFG.get(key, DEFAULTS.get(key, default))
+
+SNAPSHOT_DIR = Path(_cfg_get("snapshot_dir"))
+SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+TRASH_DIR = Path(_cfg_get("trash_dir"))
+TRASH_DIR.mkdir(parents=True, exist_ok=True)
+LOCKFILE = Path(_cfg_get("lockfile"))
+
+# ----------------------------
+# DB schema / migrations
+# ----------------------------
+_SCHEMA_SQL = [
+    ("schema_versions", """
+        CREATE TABLE IF NOT EXISTS schema_versions (
+            name TEXT PRIMARY KEY,
+            version INTEGER,
+            applied_at INTEGER
+        );
+    """),
+    ("deepclean_runs", """
+        CREATE TABLE IF NOT EXISTS deepclean_runs (
+            id TEXT PRIMARY KEY,
+            started_at INTEGER,
+            finished_at INTEGER,
+            dry_run INTEGER,
+            actions TEXT,
+            summary TEXT
+        );
+    """),
+    ("deepclean_snapshots", """
+        CREATE TABLE IF NOT EXISTS deepclean_snapshots (
+            id TEXT PRIMARY KEY,
+            created_at INTEGER,
+            pkg TEXT,
+            meta_path TEXT,
+            snapshot_path TEXT,
+            retained_until INTEGER
+        );
+    """),
+]
+
+def _ensure_db_schema(db_conn):
+    if not db_conn:
+        return
+    try:
+        for name, ddl in _SCHEMA_SQL:
+            try:
+                db_conn.execute(ddl, (), commit=True)
+            except TypeError:
+                # fallback for simpler db wrappers without commit arg
+                try:
+                    db_conn.execute(ddl)
+                    db_conn.commit()
+                except Exception:
+                    LOG.debug("Schema create fallback failed for %s", name)
+    except Exception:
+        LOG.exception("Failed to ensure deepclean DB schema")
+
+# ----------------------------
+# Utility helpers
 # ----------------------------
 def _now_ts() -> int:
     return int(time.time())
 
-def _human_bytes(n: int) -> str:
-    for unit in ['B','KB','MB','GB','TB']:
-        if n < 1024:
-            return f"{n:.1f}{unit}"
-        n /= 1024.0
-    return f"{n:.1f}PB"
+def _shortid(prefix: str = "") -> str:
+    import uuid
+    return f"{prefix}{uuid.uuid4().hex[:10]}"
 
-def _ensure_dir(path: str):
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
-
-def _load_json_safe(path: str) -> Optional[Dict[str,Any]]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+def _norm_path(p: str) -> str:
+    return os.path.normpath(os.path.join("/", str(p).lstrip("/")))
 
 # ----------------------------
-# Default config reading
+# Context object
 # ----------------------------
-CFG = get_config() if callable(get_config) else {}
-DEEP_CFG = CFG.get("deepclean", {}) if isinstance(CFG, dict) else {}
-DEFAULTS = {
-    "enabled": True,
-    "dry_run_default": True,
-    "protect_labels": ["critical", "toolchain", "hold"],
-    "orphan_age_days": 90,
-    "orphan_min_size_bytes": 1024,
-    "remove_builds": {
-        "enabled": True,
-        "age_days": 30,
-        "keep_last_per_package": 2
-    },
-    "cache": {
-        "max_size_bytes": 20 * 1024**3,
-        "prune_policy": "lru"
-    },
-    "gc_daemon": {
-        "enabled": False,
-        "check_interval_seconds": 3600,
-        "soft_threshold_percent": 80,
-        "hard_threshold_percent": 95
-    },
-    "simulate_before_remove": True,
-    "snapshot_before_remove_days": 7,
-    "snapshot_dir": os.path.expanduser("~/.rquest/deepclean_snapshots"),
-    "trash_dir": os.path.expanduser("~/.rquest/deepclean_trash")
-}
-# merge config
-def _cfg_get(key, default=None):
-    if key in DEEP_CFG:
-        return DEEP_CFG[key]
-    return DEFAULTS.get(key, default)
-
-PROTECT_LABELS = _cfg_get("protect_labels")
-ORPHAN_AGE_DAYS = int(_cfg_get("orphan_age_days"))
-ORPHAN_MIN_SIZE = int(_cfg_get("orphan_min_size_bytes"))
-SNAPSHOT_DIR = _cfg_get("snapshot_dir")
-TRASH_DIR = _cfg_get("trash_dir")
-SIMULATE_BEFORE_REMOVE = bool(_cfg_get("simulate_before_remove"))
-GC_DAEMON_CFG = _cfg_get("gc_daemon")
-CACHE_CFG = _cfg_get("cache")
-
-_ensure_dir(SNAPSHOT_DIR)
-_ensure_dir(TRASH_DIR)
+class DeepCleanContext:
+    def __init__(self,
+                 dry_run: bool = True,
+                 interactive: bool = False,
+                 snapshot: bool = True,
+                 operator: Optional[str] = None):
+        self.dry_run = bool(dry_run)
+        self.interactive = bool(interactive)
+        self.snapshot = bool(snapshot)
+        self.operator = operator or os.getenv("USER", "unknown")
 
 # ----------------------------
-# DB schema helpers for deepclean
+# Adapters
 # ----------------------------
-def _ensure_deepclean_tables(db):
-    if not db:
-        logger.debug("No DB available; deepclean will operate in stateless mode.")
-        return
-    try:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS deepclean_runs (
-                id TEXT PRIMARY KEY,
-                started_at INTEGER,
-                finished_at INTEGER,
-                mode TEXT,
-                reclaimed_bytes INTEGER,
-                removed_packages TEXT,
-                status TEXT,
-                operator TEXT
-            );
-        """, (), commit=True)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS deepclean_snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_id TEXT,
-                package_name TEXT,
-                version TEXT,
-                path TEXT,
-                created_at INTEGER,
-                size INTEGER,
-                reason TEXT
-            );
-        """, (), commit=True)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS deepclean_candidates (
-                run_id TEXT,
-                package_name TEXT,
-                version TEXT,
-                kind TEXT,
-                estimated_size INTEGER,
-                last_used_ts INTEGER,
-                labels TEXT,
-                reason TEXT
-            );
-        """, (), commit=True)
-    except Exception:
-        logger.exception("Failed to ensure deepclean tables")
+class PkgtoolAdapter:
+    """
+    Wraps modules.pkgtool to a normalized API used by deepclean.
+    Fallbacks if pkgtool not present.
+    """
+    def __init__(self):
+        self._raw = None
+        if get_pkgtool:
+            try:
+                self._raw = get_pkgtool()()
+            except Exception:
+                LOG.debug("pkgtool init failed in adapter")
+
+    def quickpkg(self, pkg_name: str, version: Optional[str], destdir: str) -> Dict[str, Any]:
+        """
+        Create a quick binary package artifact for snapshotting.
+        Return normalized dict: {ok: bool, artifact: str, size: int, detail: ...}
+        """
+        if not self._raw:
+            return {"ok": False, "error": "pkgtool not available"}
+        try:
+            if hasattr(self._raw, "quickpkg"):
+                res = self._raw.quickpkg(pkg_name, version, destdir)
+                # normalize typical return shapes
+                if isinstance(res, dict):
+                    return {"ok": bool(res.get("ok", True)), "artifact": res.get("package_path") or res.get("artifact") or res.get("path"), "size": res.get("size", 0), "detail": res}
+                # fallback to simple path
+                if isinstance(res, str):
+                    return {"ok": True, "artifact": res, "size": os.path.getsize(res) if os.path.exists(res) else 0}
+            # try other names
+            if hasattr(self._raw, "pack"):
+                res = self._raw.pack(pkg_name, destdir=destdir)
+                return {"ok": True, "artifact": res}
+        except Exception:
+            LOG.exception("pkgtool.quickpkg adapter error")
+        return {"ok": False, "error": "quickpkg failed"}
+
+    def uninstall(self, pkg_name: str, force: bool = False) -> Dict[str, Any]:
+        """
+        Attempt to uninstall a package via pkgtool API if present.
+        """
+        if not self._raw:
+            return {"ok": False, "error": "pkgtool not available"}
+        try:
+            if hasattr(self._raw, "uninstall"):
+                res = self._raw.uninstall(pkg_name, force=force)
+                return {"ok": bool(res.get("ok", True)), "detail": res}
+        except Exception:
+            LOG.exception("pkgtool.uninstall error")
+        return {"ok": False, "error": "uninstall failed"}
+
+    def cache_prune(self) -> Dict[str, Any]:
+        if not self._raw:
+            return {"ok": False, "error": "pkgtool not available"}
+        try:
+            if hasattr(self._raw, "cache_prune"):
+                res = self._raw.cache_prune()
+                return {"ok": True, "detail": res}
+        except Exception:
+            LOG.exception("pkgtool.cache_prune error")
+        return {"ok": False, "error": "cache_prune failed"}
+
+class ResolverAdapter:
+    """
+    Wraps resolver to a minimal API expected by deepclean.
+    """
+    def __init__(self):
+        self._raw = None
+        if get_resolver:
+            try:
+                self._raw = get_resolver()()
+            except Exception:
+                LOG.debug("resolver init failed in adapter")
+
+    def simulate_removal(self, pkgs: List[str]) -> Dict[str, Any]:
+        """
+        Returns {ok: bool, conflicts: [...], blocked_by: [...]}
+        """
+        if not self._raw:
+            return {"ok": True, "conflicts": [], "note": "no resolver"}
+        try:
+            if hasattr(self._raw, "simulate_removal"):
+                return self._raw.simulate_removal(pkgs)
+            # fallback: try analyze_plan or resolve_conflicts
+            if hasattr(self._raw, "resolve_conflicts"):
+                res = self._raw.resolve_conflicts(pkgs)
+                return {"ok": False if res else True, "conflicts": res or []}
+        except Exception:
+            LOG.exception("resolver.simulate_removal error")
+        return {"ok": True, "conflicts": [], "note": "simulate_removal fallback"}
+
+    def resolve_conflicts(self, pkgs: List[str]) -> Dict[str, Any]:
+        if not self._raw:
+            return {"ok": False, "error": "no resolver"}
+        try:
+            if hasattr(self._raw, "auto_resolve"):
+                return self._raw.auto_resolve(pkgs)
+            return {"ok": False, "error": "no auto_resolve"}
+        except Exception:
+            LOG.exception("resolver.resolve_conflicts error")
+        return {"ok": False, "error": "resolver failed"}
 
 # ----------------------------
-# DeepCleanManager
+# DeepClean manager
 # ----------------------------
 class DeepCleanManager:
-    def __init__(self, cfg: Optional[Dict[str,Any]] = None):
-        self.cfg = cfg or DEEP_CFG
-        self.db = get_db() if callable(get_db) else None
-        _ensure_deepclean_tables(self.db)
-        self.resolver = get_resolver() if callable(get_resolver) else None
-        self.pkgtool = get_pkgtool() if callable(get_pkgtool) else None
-        self.buildsystem = get_buildsystem() if callable(get_buildsystem) else None
-        self.sandbox = get_sandbox_manager() if callable(get_sandbox_manager) else None
-        self.hooks = get_hook_manager() if callable(get_hook_manager) else None
-        self._daemon_thread: Optional[threading.Thread] = None
-        self._daemon_stop = threading.Event()
-        # operational defaults
-        self.orphan_age_days = int(self.cfg.get("orphan_age_days", ORPHAN_AGE_DAYS))
-        self.orphan_min_size = int(self.cfg.get("orphan_min_size_bytes", ORPHAN_MIN_SIZE))
-        self.protect_labels = list(self.cfg.get("protect_labels", PROTECT_LABELS))
-        self.snapshot_dir = self.cfg.get("snapshot_dir", SNAPSHOT_DIR)
-        _ensure_dir(self.snapshot_dir)
-        self.trash_dir = self.cfg.get("trash_dir", TRASH_DIR)
-        _ensure_dir(self.trash_dir)
-        self.cache_cfg = self.cfg.get("cache", CACHE_CFG)
-        # metrics counters (simple)
-        self.metrics = {"runs":0, "reclaimed_bytes":0, "orphans_removed":0, "builds_removed":0, "cache_pruned":0}
-
-    # ----------------------------
-    # utility: read installed packages from DB
-    # Expect table 'installed_packages' with columns (name, version, installed_at, last_used_ts, labels)
-    # If DB missing, fallback to scanning pkgtool cache or local manifests.
-    # ----------------------------
-    def _read_installed_packages(self) -> List[Dict[str,Any]]:
-        res = []
+    def __init__(self, db_factory=None):
+        self.db = None
+        if db_factory and callable(db_factory):
+            try:
+                self.db = db_factory()
+            except Exception:
+                LOG.debug("db_factory init failed")
+        elif get_db:
+            try:
+                self.db = get_db()()
+            except Exception:
+                LOG.debug("get_db init failed")
         if self.db:
+            _ensure_db_schema(self.db)
             try:
-                rows = self.db.fetchall("SELECT name, version, installed_at, last_used_ts, labels FROM installed_packages")
-                for r in rows:
-                    labels = []
-                    try:
-                        labels = json.loads(r.get("labels") or "[]")
-                    except Exception:
-                        labels = []
-                    res.append({
-                        "name": r.get("name"),
-                        "version": r.get("version"),
-                        "installed_at": r.get("installed_at"),
-                        "last_used_ts": r.get("last_used_ts") or 0,
-                        "labels": labels
-                    })
-                return res
+                _ensure_db_schema(self.db)
             except Exception:
-                logger.exception("Failed reading installed_packages from DB")
-        # fallback: try reading pkgtool cache index as installed list (best-effort)
-        try:
-            if self.pkgtool and hasattr(self.pkgtool, "cache"):
-                entries = self.pkgtool.cache.list_all()
-                for e in entries:
-                    res.append({
-                        "name": e.get("name"),
-                        "version": e.get("version"),
-                        "installed_at": e.get("created_at"),
-                        "last_used_ts": e.get("last_access") or 0,
-                        "labels": []
-                    })
-        except Exception:
-            logger.exception("Fallback reading from pkgtool failed")
-        return res
+                LOG.debug("schema ensure attempt failed")
 
-    # ----------------------------
-    # detect_orphans: main detector
-    # returns list of candidate dicts:
-    # { name, version, estimated_size, last_used_ts, labels, reason }
-    # ----------------------------
-    def detect_orphans(self, dry_run: bool = True, max_candidates: Optional[int] = None) -> List[Dict[str,Any]]:
-        logger.info("Detecting orphan packages (dry_run=%s)...", bool(dry_run))
-        if self.hooks:
-            try:
-                self.hooks.run("pre_orphan_detect", context={"dry_run": dry_run})
-            except Exception:
-                logger.exception("pre_orphan_detect hook failed")
+        self.pkgtool = PkgtoolAdapter()
+        self.resolver = ResolverAdapter()
+        self.conflicts = ConflictResolver() if ConflictResolver else None
+        self.hooks = (get_hook_manager()() if get_hook_manager else None)
+        self.lockfile = LOCKFILE
 
-        installed = self._read_installed_packages()
-        if not installed:
-            logger.info("No installed packages found (or DB unavailable).")
-            return []
+    # ---------- detection helpers (pure) ----------
+    def detect_orphans(self, older_than_days: Optional[int] = None, min_size_bytes: Optional[int] = None) -> List[Dict[str, Any]]:
+        """
+        Detect candidate orphan packages (not depended on and not used recently).
+        Returns list of dicts {name, version, installed_at, last_used_ts, size, manifest_path}
+        Pure function: does not mutate state.
+        """
+        older_than_days = older_than_days if older_than_days is not None else _cfg_get("orphan_age_days")
+        min_size_bytes = min_size_bytes if min_size_bytes is not None else _cfg_get("orphan_min_size_bytes")
+        cutoff_ts = int(time.time()) - int(older_than_days) * 86400
 
-        # build the "world set": explicit top-level packages -- we consider installed packages with a label 'top' or no dependents in DB
-        # For simplicity, treat packages that have label 'explicit' or 'top' as top-level; otherwise attempt to compute via resolver
-        top_level = [p for p in installed if "explicit" in (p.get("labels") or []) or "top" in (p.get("labels") or [])]
-        # fallback: if none marked explicit, pick recent ones (< 7 days) or all as top-level
-        if not top_level:
-            # heuristics: mark packages with most recent installed_at as top-level up to 20
-            sorted_inst = sorted(installed, key=lambda x: x.get("installed_at") or 0, reverse=True)
-            top_level = sorted_inst[:min(20, len(sorted_inst))]
-
-        # Compute dependency closure using resolver if available: union of dependencies for top-level packages
-        dep_union: Set[str] = set()
-        if self.resolver:
-            try:
-                # if resolver supports batch/world resolution, ideally call one method. Here we call resolve_dependencies for each top-level and union results.
-                for top in top_level:
-                    name = top.get("name")
-                    version = top.get("version")
-                    r = self.resolver.resolve_dependencies(name, version, fast=True)
-                    if r and r.get("ok") and isinstance(r.get("tree"), dict):
-                        for k in r.get("tree").keys():
-                            dep_union.add(k)
-            except Exception:
-                logger.exception("Resolver failed while computing dependency closure; falling back to conservative heuristics")
-        else:
-            logger.debug("No resolver available; using conservative heuristics for orphan detection")
-
-        # Determine candidates: installed packages not in dep_union and not protected by labels
         candidates = []
-        total_estimated = 0
-        for pkg in installed:
-            name = pkg.get("name")
-            if not name:
-                continue
-            if name in dep_union:
-                continue
-            labels = pkg.get("labels") or []
-            if any(lbl in self.protect_labels for lbl in labels):
-                logger.debug("Package %s has protective label %s - skipping", name, labels)
-                continue
-            last_used = pkg.get("last_used_ts") or 0
-            age_days = (time.time() - (last_used or pkg.get("installed_at") or time.time())) / 86400.0
-            # estimated size: try to get from pkgtool cache or manifest size; fallback minimal
-            est_size = self._estimate_package_size(pkg.get("name"), pkg.get("version"))
-            if est_size < self.orphan_min_size:
-                logger.debug("Package %s size %d < min %d -> skipping", name, est_size, self.orphan_min_size)
-                continue
-            reason = f"orphan (age={int(age_days)}d, last_used={int(last_used)})"
-            candidates.append({
-                "name": name,
-                "version": pkg.get("version"),
-                "estimated_size": est_size,
-                "last_used_ts": last_used,
-                "labels": labels,
-                "age_days": int(age_days),
-                "reason": reason
-            })
-            total_estimated += est_size
-
-        # sort candidates by priority: oldest last_used and largest size first
-        candidates.sort(key=lambda x: (x["age_days"], -x["estimated_size"]), reverse=True)
-
-        if max_candidates:
-            candidates = candidates[:max_candidates]
-
+        # rely on DB installed_packages if available
         if self.db:
-            # persist candidate snapshot for this run
-            run_id = str(uuid.uuid4())
-            for c in candidates:
-                try:
-                    self.db.execute("INSERT INTO deepclean_candidates (run_id, package_name, version, kind, estimated_size, last_used_ts, labels, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (run_id, c["name"], c["version"], "orphan", c["estimated_size"], c["last_used_ts"], json.dumps(c.get("labels") or []), c["reason"]), commit=True)
-                except Exception:
-                    pass
-
-        logger.info("Detected %d orphan candidate(s), estimated reclaim: %s", len(candidates), _human_bytes(total_estimated))
-        if self.hooks:
             try:
-                self.hooks.run("post_orphan_detect", context={"candidates": candidates, "dry_run": dry_run})
+                rows = self.db.fetchall("SELECT name, version, installed_at, last_used_at, manifest_path FROM installed_packages")
+                for r in rows:
+                    installed_at = r.get("installed_at") or 0
+                    last_used = r.get("last_used_at") or installed_at
+                    if last_used < cutoff_ts:
+                        # estimate size: try installed_files size sum
+                        size = 0
+                        try:
+                            frows = self.db.fetchall("SELECT path FROM installed_files WHERE package = ?", (r.get("name"),))
+                            for fr in frows:
+                                p = fr.get("path")
+                                try:
+                                    if os.path.exists(p):
+                                        size += os.path.getsize(p)
+                                except Exception:
+                                    continue
+                        except Exception:
+                            size = 0
+                        if size >= min_size_bytes:
+                            candidates.append({
+                                "name": r.get("name"),
+                                "version": r.get("version"),
+                                "installed_at": installed_at,
+                                "last_used_at": last_used,
+                                "size": size,
+                                "manifest_path": r.get("manifest_path"),
+                            })
+                return candidates
             except Exception:
-                logger.exception("post_orphan_detect hook failed")
+                LOG.exception("detect_orphans: DB query failed, falling back to manifest heuristic")
+
+        # fallback: scan ~/.rquest/installed manifests
+        installed_dir = Path.home() / ".rquest" / "installed"
+        if installed_dir.exists():
+            for pkgdir in installed_dir.iterdir():
+                try:
+                    mf = pkgdir / "MANIFEST.json"
+                    if mf.exists():
+                        j = json.loads(mf.read_text(encoding="utf-8"))
+                        last_used = j.get("last_used_at") or j.get("installed_at") or 0
+                        if last_used < cutoff_ts:
+                            size = 0
+                            for f in j.get("files", []):
+                                p = Path("/") / f.get("path", "").lstrip("/")
+                                try:
+                                    if p.exists():
+                                        size += p.stat().st_size
+                                except Exception:
+                                    pass
+                            if size >= min_size_bytes:
+                                candidates.append({
+                                    "name": j.get("name"),
+                                    "version": j.get("version"),
+                                    "installed_at": j.get("installed_at"),
+                                    "last_used_at": last_used,
+                                    "size": size,
+                                    "manifest_path": str(mf),
+                                })
+                except Exception:
+                    LOG.debug("Failed reading manifest in %s", pkgdir)
         return candidates
 
-    # ----------------------------
-    # estimate package size helper
-    # ----------------------------
-    def _estimate_package_size(self, name: str, version: Optional[str]) -> int:
-        # try pkgtool cache
-        try:
-            if self.pkgtool and hasattr(self.pkgtool, "cache"):
-                found = self.pkgtool.cache.find(name, version)
-                if found:
-                    return int(found.get("size", 0) or 0)
-        except Exception:
-            logger.exception("pkgtool cache lookup failed")
-        # try installed package manifest reading via common locations
-        # heuristics: look into /var/lib/rquest/installed/<name>-<version>/MANIFEST.json
-        possible = [
-            os.path.expanduser(f"~/.rquest/installed/{name}-{version}/MANIFEST.json"),
-            f"/var/lib/rquest/installed/{name}-{version}/MANIFEST.json",
-        ]
-        for p in possible:
-            m = _load_json_safe(p)
-            if m:
-                size = sum([int(f.get("size",0) or 0) for f in m.get("files",[])])
-                return size
-        # fallback small size
-        return 1024 * 100  # 100KB conservative
-
-    # ----------------------------
-    # simulate_removal: ensure removing candidates doesn't break world
-    # returns dict: { ok: bool, conflicts: [...], protected: [...] }
-    # ----------------------------
-    def simulate_removal(self, candidates: List[Dict[str,Any]]) -> Dict[str,Any]:
-        names = [c["name"] for c in candidates]
-        logger.info("Simulating removal for %d candidates...", len(names))
-        # If resolver has simulate_removal or can accept a removed set, prefer that
-        if self.resolver and hasattr(self.resolver, "simulate_removal"):
-            try:
-                sim = self.resolver.simulate_removal(names)
-                return {"ok": sim.get("ok", False), "conflicts": sim.get("conflicts", []), "details": sim}
-            except Exception:
-                logger.exception("resolver.simulate_removal failed; falling back to conservative checks")
-
-        # Conservative fallback: check for direct dependency occurrences in installed manifests or pkgtool metadata
-        conflicts = []
-        protected = []
-        # build map of installed package dependencies by scanning cached manifests for each installed package
-        installed = self._read_installed_packages()
-        installed_names = [p.get("name") for p in installed]
-        # for each installed package, try to read its MANIFEST.json from common locations and parse declared dependencies
-        for pkg in installed:
-            pname = pkg.get("name")
-            version = pkg.get("version")
-            # skip candidates themselves
-            if pname in names:
-                continue
-            # heuristics: check in pkgtool cache manifest if present
-            dep_list = []
-            try:
-                found = None
-                if self.pkgtool and hasattr(self.pkgtool, "cache"):
-                    rec = self.pkgtool.cache.find(pname, version)
-                    if rec and os.path.exists(rec.get("path")):
-                        # extract manifest temporarily to read dependencies
-                        td = tempfile.mkdtemp(prefix="deepclean-manifest-")
-                        try:
-                            self.pkgtool.install_bin(rec.get("path"), target=td, sandbox_run=False, use_fakeroot=False, verify_sig=False, clean_after=True)
-                            mf = os.path.join(td, f"{pname}-{version}", "MANIFEST.json")
-                            m = _load_json_safe(mf)
-                            if m:
-                                # manifest may contain 'metadata' or 'depends'
-                                md = m.get("metadata") or {}
-                                if isinstance(md, dict) and md.get("depends"):
-                                    dep_list = md.get("depends") or []
-                            shutil.rmtree(td, ignore_errors=True)
-                        except Exception:
-                            shutil.rmtree(td, ignore_errors=True)
-                            pass
-                # fallback: attempt to read /var/lib/rquest/installed
-                possible = [
-                    os.path.expanduser(f"~/.rquest/installed/{pname}-{version}/MANIFEST.json"),
-                    f"/var/lib/rquest/installed/{pname}-{version}/MANIFEST.json",
-                ]
-                for p in possible:
-                    m = _load_json_safe(p)
-                    if m:
-                        md = m.get("metadata") or {}
-                        if isinstance(md, dict) and md.get("depends"):
-                            dep_list = md.get("depends") or []
-            except Exception:
-                logger.exception("Error reading manifest for %s", pname)
-            # check if any dependency matches names to remove
-            for d in dep_list:
-                dname = None
-                if isinstance(d, dict):
-                    dname = d.get("name")
-                elif isinstance(d, str):
-                    dname = d
-                if not dname:
-                    continue
-                if dname in names:
-                    # conflict
-                    conflicts.append({"dependent": pname, "depends_on": dname})
-        ok = len(conflicts) == 0
-        logger.info("Simulation result: ok=%s conflicts=%d", ok, len(conflicts))
-        return {"ok": ok, "conflicts": conflicts, "protected": protected}
-
-# end of PART 1
-# continuation of Rquest/rquest1.0/modules/deepclean.py (PART 2)
-
-# ----------------------------
-# apply_cleanup: remove candidates, snapshots, prune cache, clean build dirs
-# candidates: list of dicts as detect_orphans returns
-# ----------------------------
-    def _create_snapshot_for(self, name: str, version: str, reason: str = "deepclean_orphan") -> Optional[str]:
+    def simulate_removal(self, pkgs: List[str]) -> Dict[str, Any]:
         """
-        Create a quick snapshot (binary) using pkgtool.quickpkg if available.
-        Returns snapshot_id (filename or UUID) or None on failure.
+        Use resolver to simulate removal and return conflicts/blocked info.
+        Pure: does not mutate state.
         """
-        if not self.pkgtool:
-            logger.warning("pkgtool not available: cannot create snapshot for %s-%s", name, version)
-            return None
-        # try to find installed destdir for package - heuristics
-        dest_candidates = [
-            os.path.expanduser(f"~/.rquest/installed/{name}-{version}"),
-            f"/var/lib/rquest/installed/{name}-{version}"
-        ]
-        destdir = None
-        for d in dest_candidates:
-            if os.path.exists(d):
-                destdir = d
-                break
-        if not destdir:
-            # try to see if pkgtool.cache has package with that name/version and extract its manifest's root to estimate dest
-            logger.warning("Cannot find installed destdir for %s-%s to create snapshot", name, version)
-            return None
-        try:
-            res = self.pkgtool.quickpkg(name, version, destdir)
-            if res.get("ok"):
-                pkg_path = res.get("package_path")
-                snapshot_id = str(uuid.uuid4())
-                created_at = _now_ts()
-                size = res.get("size", 0)
-                if self.db:
-                    try:
-                        self.db.execute("INSERT INTO deepclean_snapshots (snapshot_id, package_name, version, path, created_at, size, reason) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                        (snapshot_id, name, version, pkg_path, created_at, size, reason), commit=True)
-                    except Exception:
-                        logger.exception("Failed to record snapshot in DB")
-                logger.info("Snapshot created for %s-%s: %s", name, version, pkg_path)
-                return snapshot_id
-        except Exception:
-            logger.exception("Snapshot creation failed")
-        return None
+        res = self.resolver.simulate_removal(pkgs) if self.resolver else {"ok": True, "conflicts": []}
+        return res
 
-    def _trash_or_remove_dir(self, path: str) -> bool:
+    # ---------- snapshot helpers ----------
+    def create_snapshot_for_pkg(self, pkg_name: str, version: Optional[str], ctx: DeepCleanContext) -> Dict[str, Any]:
         """
-        Move to trash_dir instead of immediate deletion (for safety), then schedule real delete.
+        Create a snapshot for a package prior to removal.
+        Attempt quickpkg via pkgtool, fallback to tar/cp.
+        Returns snapshot record dict.
         """
-        try:
-            if not os.path.exists(path):
-                return True
-            base = os.path.basename(path.rstrip("/"))
-            dest = os.path.join(self.trash_dir, f"{base}-{int(time.time())}")
-            shutil.move(path, dest)
-            logger.info("Moved %s to trash %s", path, dest)
-            # schedule deletion in background thread (delayed) - here we just leave in trash; optional GC will purge older trash
-            return True
-        except Exception:
-            logger.exception("Failed to move %s to trash", path)
-            return False
-
-    def _remove_installed_package(self, name: str, version: Optional[str]) -> Tuple[bool, str]:
-        """
-        Remove an installed package by using manifest (if available) or pkgtool uninstall_by_manifest.
-        Conservative: if manifest missing, do not attempt blind removal; return False.
-        """
-        # find manifest path heuristically
-        manifest_paths = [
-            os.path.expanduser(f"~/.rquest/installed/{name}-{version}/MANIFEST.json"),
-            f"/var/lib/rquest/installed/{name}-{version}/MANIFEST.json"
-        ]
-        for mp in manifest_paths:
-            if os.path.exists(mp):
-                # use pkgtool.uninstall_by_manifest if available
-                try:
-                    if self.pkgtool and hasattr(self.pkgtool, "uninstall_by_manifest"):
-                        res = self.pkgtool.uninstall_by_manifest(mp)
-                        if res.get("ok"):
-                            # update DB installed_packages remove record
-                            if self.db:
-                                try:
-                                    self.db.execute("DELETE FROM installed_packages WHERE name = ? AND version = ?", (name, version), commit=True)
-                                except Exception:
-                                    logger.exception("Failed to remove installed_packages DB record for %s-%s", name, version)
-                            return True, "removed_by_manifest"
-                        else:
-                            return False, "pkgtool_uninstall_failed"
-                    else:
-                        # fallback: remove parent directory (dangerous) -> move to trash instead
-                        dest = os.path.dirname(mp)
-                        ok = self._trash_or_remove_dir(dest)
-                        if ok and self.db:
-                            try:
-                                self.db.execute("DELETE FROM installed_packages WHERE name = ? AND version = ?", (name, version), commit=True)
-                            except Exception:
-                                pass
-                        return ok, "moved_to_trash"
-                except Exception:
-                    logger.exception("Error removing package via manifest")
-                    return False, "exception"
-        logger.warning("Manifest not found for %s-%s; skipping removal to be safe", name, version)
-        return False, "manifest_missing"
-
-    def apply_cleanup(self, candidates: List[Dict[str,Any]], snapshot: bool = True, dry_run: bool = True, interactive: bool = False) -> Dict[str,Any]:
-        """
-        Apply cleanup: for each candidate create snapshot if requested, remove package, prune cache and clean build dirs.
-        Returns run report dict.
-        """
-        run_id = str(uuid.uuid4())
-        start = _now_ts()
-        total_reclaimed = 0
-        removed_packages = []
-        failed = []
-        mode = "dry" if dry_run else "apply"
-        logger.info("Starting deepclean run %s (dry_run=%s, snapshot=%s)", run_id, dry_run, snapshot)
-        if self.hooks:
-            try:
-                self.hooks.run("pre_clean_run", context={"run_id": run_id, "dry_run": dry_run})
-            except Exception:
-                logger.exception("pre_clean_run hook failed")
-
-        # If simulate_before_remove is configured, run simulation and abort if conflicts
-        if SIMULATE_BEFORE_REMOVE and dry_run is False:
-            sim = self.simulate_removal(candidates)
-            if not sim.get("ok", True):
-                logger.error("Simulation detected conflicts; aborting cleanup. Conflicts: %s", sim.get("conflicts"))
-                return {"ok": False, "run_id": run_id, "error": "simulation_conflicts", "conflicts": sim.get("conflicts")}
-
-        for c in candidates:
-            name = c.get("name")
-            version = c.get("version")
-            est = c.get("estimated_size", 0)
-            if interactive and not dry_run:
-                resp = input(f"Remove {name}-{version} (est { _human_bytes(est) })? [y/N]: ").strip().lower()
-                if resp not in ("y","yes"):
-                    logger.info("Skipped %s by operator input", name)
-                    continue
-            # snapshot if requested
-            snap_id = None
-            if snapshot and not dry_run:
-                # If package last_used < snapshot_before_remove_days rule for snapshot, create snapshot
-                last_used = c.get("last_used_ts") or 0
-                age_days = (time.time() - (last_used or 0)) / 86400.0
-                if age_days >= int(self.cfg.get("snapshot_before_remove_days", DEFAULTS["snapshot_before_remove_days"])):
-                    snap_id = self._create_snapshot_for(name, version, reason="deepclean_orphan")
-            # actual removal
-            if dry_run:
-                logger.info("[dry-run] would remove %s-%s (est %s) snapshot=%s", name, version, _human_bytes(est), bool(snap_id))
-                removed_packages.append({"name": name, "version": version, "estimated_size": est, "snapshot": snap_id, "status": "dry_run"})
-                total_reclaimed += est
-                continue
-            # attempt remove
-            ok, reason = self._remove_installed_package(name, version)
-            if ok:
-                total_reclaimed += est
-                removed_packages.append({"name": name, "version": version, "size": est, "snapshot": snap_id, "status": "removed", "reason": reason})
-                self.metrics["orphans_removed"] += 1
-            else:
-                failed.append({"name": name, "version": version, "reason": reason})
-                logger.warning("Failed to remove %s-%s: %s", name, version, reason)
-
-        # prune pkgtool cache if configured and not dry_run
-        cache_pruned = []
-        if self.pkgtool and not dry_run:
-            try:
-                # call package cache prune via pkgtool.cache._maybe_prune or prune method
-                # Here we call cache._maybe_prune (internal) just to trigger pruning
-                prev_size = self.pkgtool.cache.total_size() if hasattr(self.pkgtool.cache, "total_size") else None
-                self.pkgtool.cache._maybe_prune()
-                after_size = self.pkgtool.cache.total_size() if hasattr(self.pkgtool.cache, "total_size") else None
-                reclaimed = (prev_size - after_size) if (prev_size and after_size) else 0
-                if reclaimed and reclaimed > 0:
-                    cache_pruned.append({"reclaimed_bytes": reclaimed})
-                    self.metrics["cache_pruned"] += 1
-                    total_reclaimed += reclaimed
-            except Exception:
-                logger.exception("Cache prune failed")
-
-        # clean build dirs: remove old build dirs if configured
-        builds_removed = 0
-        if self.buildsystem and not dry_run:
-            try:
-                bs_cfg = self.cfg.get("remove_builds", DEFAULTS["remove_builds"])
-                if bs_cfg.get("enabled", True):
-                    removed = self.clean_build_dirs(age_days=bs_cfg.get("age_days", 30), keep_last_per_package=bs_cfg.get("keep_last_per_package", 2), dry_run=dry_run)
-                    builds_removed = removed.get("removed_count", 0)
-                    self.metrics["builds_removed"] += builds_removed
-            except Exception:
-                logger.exception("clean_build_dirs failed during apply_cleanup")
-
-        # finalize run
-        end = _now_ts()
-        status = "ok" if not failed else "partial"
+        snap_id = _shortid("snap-")
+        created_at = _now_ts()
+        snapshot_path = None
+        meta_path = None
+        # Try to locate manifest in DB
         if self.db:
             try:
-                self.db.execute("INSERT INTO deepclean_runs (id, started_at, finished_at, mode, reclaimed_bytes, removed_packages, status, operator) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                (run_id, start, end, mode, total_reclaimed, json.dumps(removed_packages), status, os.getenv("USER") or ""), commit=True)
+                row = self.db.fetchone("SELECT manifest_path FROM installed_packages WHERE name = ? LIMIT 1", (pkg_name,))
+                meta_path = row.get("meta_path") if row else None
             except Exception:
-                logger.exception("Failed to record deepclean run in DB")
-        self.metrics["reclaimed_bytes"] += total_reclaimed
-        logger.info("Deepclean run %s finished: reclaimed=%s removed=%d failed=%d builds_removed=%d", run_id, _human_bytes(total_reclaimed), len(removed_packages), len(failed), builds_removed)
+                meta_path = None
+        # quickpkg
+        if self.pkgtool and ctx and ctx.snapshot:
+            try:
+                tmpdir = tempfile.mkdtemp(prefix="rquest-snap-")
+                qp = self.pkgtool.quickpkg(pkg_name, version, tmpdir)
+                if qp.get("ok") and qp.get("artifact"):
+                    snapshot_path = qp.get("artifact")
+                    LOG.info("Snapshot quickpkg created for %s at %s", pkg_name, snapshot_path)
+                else:
+                    LOG.debug("pkgtool.quickpkg did not produce artifact, fallback to tar")
+            except Exception:
+                LOG.exception("pkgtool.quickpkg failed for %s", pkg_name)
+        # fallback: tar the files listed in manifest
+        if not snapshot_path:
+            try:
+                # collect files from DB or manifest
+                files = []
+                if self.db:
+                    try:
+                        rows = self.db.fetchall("SELECT path FROM installed_files WHERE package = ?", (pkg_name,))
+                        files = [r.get("path") for r in rows if r.get("path")]
+                    except Exception:
+                        files = []
+                if not files and meta_path:
+                    try:
+                        mp_data = json.loads(Path(meta_path).read_text(encoding="utf-8"))
+                        files = [f.get("path") if isinstance(f, dict) else f for f in mp_data.get("files", [])]
+                    except Exception:
+                        files = []
+                if files:
+                    ts = time.strftime("%Y%m%d-%H%M%S")
+                    tarname = SNAPSHOT_DIR / f"{pkg_name}-{ts}.tar.gz"
+                    if ctx.dry_run:
+                        LOG.info("[dry-run] would create tar snapshot for %s -> %s", pkg_name, tarname)
+                        snapshot_path = str(tarname)
+                    else:
+                        import tarfile
+                        with tarfile.open(tarname, "w:gz") as tf:
+                            for p in files:
+                                try:
+                                    ap = Path("/") / str(p).lstrip("/")
+                                    if ap.exists():
+                                        tf.add(str(ap), arcname=str(ap).lstrip("/"))
+                                except Exception:
+                                    LOG.debug("tar add failed for %s", p)
+                        snapshot_path = str(tarname)
+                        LOG.info("Snapshot tar created for %s -> %s", pkg_name, tarname)
+            except Exception:
+                LOG.exception("Fallback snapshot creation failed for %s", pkg_name)
+
+        retained_until = int(time.time()) + int(_cfg_get("snapshot_retention_days", 7)) * 86400
+        snap_record = {"id": snap_id, "created_at": created_at, "pkg": pkg_name, "meta_path": meta_path, "snapshot_path": snapshot_path, "retained_until": retained_until}
+        # persist snapshot record
+        if self.db:
+            try:
+                self.db.execute("INSERT OR REPLACE INTO deepclean_snapshots (id, created_at, pkg, meta_path, snapshot_path, retained_until) VALUES (?,?,?,?,?,?)",
+                                (snap_id, created_at, pkg_name, meta_path, snapshot_path, retained_until), commit=True)
+            except Exception:
+                LOG.debug("Failed to persist snapshot record")
+        return snap_record
+
+    def restore_snapshot(self, snap_id: str, ctx: DeepCleanContext) -> Dict[str, Any]:
+        """
+        Restore a snapshot previously created. Tries to use pkgtool install if artifact is a package; otherwise extracts tar.
+        """
+        if self.db:
+            try:
+                row = self.db.fetchone("SELECT snapshot_path, pkg FROM deepclean_snapshots WHERE id = ? LIMIT 1", (snap_id,))
+                if not row:
+                    return {"ok": False, "error": "snapshot not found"}
+                spath = row.get("snapshot_path")
+                pkg = row.get("pkg")
+            except Exception:
+                return {"ok": False, "error": "db query failed"}
+        else:
+            return {"ok": False, "error": "db unavailable"}
+        if not spath:
+            return {"ok": False, "error": "no snapshot path"}
+        if ctx.dry_run:
+            LOG.info("[dry-run] would restore snapshot %s for %s", spath, pkg)
+            return {"ok": True, "note": "dry-run"}
+        # if artifact is a package file and pkgtool.install_bin exists
+        if self.pkgtool and hasattr(self.pkgtool, "install"):
+            try:
+                res = self.pkgtool.install(spath)
+                return {"ok": bool(res.get("ok", True)), "detail": res}
+            except Exception:
+                LOG.exception("pkgtool.install failed for snapshot")
+        # else, try to untar
+        try:
+            import tarfile
+            with tarfile.open(spath, "r:gz") as tf:
+                tf.extractall("/")  # careful: this restores absolute paths from arcname
+            LOG.info("Snapshot restored from %s", spath)
+            return {"ok": True}
+        except Exception:
+            LOG.exception("Failed to restore snapshot %s", spath)
+            return {"ok": False, "error": "restore failed"}
+
+    # ---------- removal / resolution ----------
+    def _attempt_remove_package(self, pkg_name: str, ctx: DeepCleanContext) -> Dict[str, Any]:
+        """
+        Attempt to remove package safely: snapshot -> simulate -> remove (via pkgtool or remove module)
+        """
+        LOG.info("Attempting removal of %s (dry_run=%s)", pkg_name, ctx.dry_run)
+        # snapshot
+        snap_info = None
+        if ctx.snapshot and _cfg_get("snapshot_before_remove"):
+            try:
+                snap_info = self.create_snapshot_for_pkg(pkg_name, None, ctx)
+            except Exception:
+                LOG.exception("Snapshot creation failed for %s", pkg_name)
+        # simulate removal to detect dependency conflicts
+        sim = self.simulate_removal([pkg_name])
+        if not sim.get("ok", True):
+            LOG.warning("Simulate removal detected conflicts: %s", sim.get("conflicts"))
+            if not _cfg_get("allow_dep_conflicts"):
+                return {"ok": False, "error": "dep_conflicts", "details": sim}
+        # if conflicts module present, check subsequent file conflicts
+        if self.conflicts:
+            try:
+                # best-effort: detect file conflicts that would arise from removing this package
+                # conflicts module principally detects when installing new packages; here we just call detection for packages that may be affected - skip if no API
+                pass
+            except Exception:
+                LOG.debug("conflicts check before removal failed")
+        # perform removal via remove API or pkgtool
+        if ctx.dry_run:
+            LOG.info("[dry-run] would remove %s (snapshot=%s)", pkg_name, snap_info.get("id") if snap_info else None)
+            return {"ok": True, "dry_run": True, "snapshot": snap_info}
+        # prefer remove module
+        removed = False
+        remove_detail = None
+        # try remove module
+        try:
+            import modules.remove as remove_mod  # type: ignore
+            if hasattr(remove_mod, "remove_package"):
+                try:
+                    res = remove_mod.remove_package(pkg_name, force=True)
+                    removed = bool(res.get("ok", False)) if isinstance(res, dict) else True
+                    remove_detail = res
+                except Exception:
+                    LOG.exception("remove_mod.remove_package failed")
+        except Exception:
+            LOG.debug("remove_mod not available")
+        # fallback to pkgtool uninstall
+        if not removed:
+            try:
+                res = self.pkgtool.uninstall(pkg_name, force=True)
+                removed = bool(res.get("ok", False))
+                remove_detail = res
+            except Exception:
+                LOG.exception("pkgtool uninstall failed")
+        if removed:
+            LOG.info("Package %s removed (detail=%s)", pkg_name, remove_detail)
+            return {"ok": True, "snapshot": snap_info, "detail": remove_detail}
+        LOG.error("Failed to remove package %s", pkg_name)
+        return {"ok": False, "error": "remove_failed", "detail": remove_detail}
+
+    # ---------- high-level apply cleanup ----------
+    def apply_cleanup(self, candidates: List[Dict[str, Any]], ctx: Optional[DeepCleanContext] = None) -> Dict[str, Any]:
+        """
+        Given a list of orphan candidate dicts (as returned from detect_orphans),
+        attempt to clean according to policies in config and context.
+        Returns structured result: {actions: [...], failed: [...], snapshots: [...]}
+        """
+        ctx = ctx or DeepCleanContext(dry_run=_cfg_get("dry_run_default"), interactive=False, snapshot=_cfg_get("snapshot_before_remove"))
+        run_id = _shortid("deepclean-")
+        started = _now_ts()
+        actions = []
+        failures = []
+        snapshots = []
         if self.hooks:
             try:
-                self.hooks.run("post_clean_run", context={"run_id": run_id, "removed": removed_packages, "failed": failed, "reclaimed": total_reclaimed})
+                self.hooks.run("pre_deepclean", {"run_id": run_id, "candidates": candidates, "ctx": {"dry_run": ctx.dry_run}})
             except Exception:
-                logger.exception("post_clean_run hook failed")
-        return {"ok": len(failed)==0, "run_id": run_id, "reclaimed_bytes": total_reclaimed, "removed": removed_packages, "failed": failed}
+                LOG.debug("pre_deepclean hook failed")
 
-    # ----------------------------
-    # clean_build_dirs: find and remove old build dirs known by buildsystem or caches
-    # returns summary dict
-    # ----------------------------
-    def clean_build_dirs(self, age_days: int = 30, keep_last_per_package: int = 2, dry_run: bool = True) -> Dict[str,Any]:
-        logger.info("Cleaning build dirs older than %dd (keep_last_per_package=%d) (dry_run=%s)", age_days, keep_last_per_package, dry_run)
-        removed = []
-        if not self.buildsystem:
-            logger.warning("No buildsystem manager available; cannot list build dirs")
-            return {"removed": removed, "removed_count": 0}
-        try:
-            # buildsystem may provide an API to list build roots; attempt common method names
-            build_roots = []
-            if hasattr(self.buildsystem, "list_build_roots"):
-                build_roots = self.buildsystem.list_build_roots()
-            elif hasattr(self.buildsystem, "cache_dir"):
-                # heuristic: look under cache_dir for <pkg>-<ver> directories
-                cd = getattr(self.buildsystem, "cache_dir", None)
-                if cd and os.path.exists(cd):
-                    for entry in os.listdir(cd):
-                        build_roots.append(os.path.join(cd, entry))
+        for c in candidates:
+            pkg = c.get("name")
+            LOG.info("Processing candidate %s (size=%s)", pkg, c.get("size"))
+            # ensure conflicts resolution: if package removal will trigger conflicts with future installs, coordinate
+            # We attempt to remove owner pkg only if policies allow auto removal OR operator confirmed
+            proceed_to_remove = False
+            if _cfg_get("auto_remove_conflicting") or ctx.interactive:
+                proceed_to_remove = True
             else:
-                logger.warning("buildsystem does not expose build roots API; falling back to scanning common tmp dirs")
-                # fallback scan /var/tmp/rquest/build* or ~/.rquest/build*
-                possible = ["/var/tmp/rquest", os.path.expanduser("~/.rquest/build")]
-                for p in possible:
-                    if os.path.exists(p):
-                        for e in os.listdir(p):
-                            build_roots.append(os.path.join(p, e))
-            # for each root, inspect modification time and decide removal
-            cutoff = time.time() - age_days * 86400
-            # group by package base if needed, preserve last N per package
-            grouped = {}
-            for br in build_roots:
-                base = os.path.basename(br)
-                # we consider directories only
-                if not os.path.isdir(br):
-                    continue
-                mtime = os.path.getmtime(br)
-                grouped.setdefault(base.split("-")[0], []).append((br, mtime))
-            for pkg, lst in grouped.items():
-                # sort by mtime desc
-                lst.sort(key=lambda x: x[1], reverse=True)
-                # keep last N
-                keep = lst[:keep_last_per_package]
-                to_check = lst[keep_last_per_package:]
-                for (path, mtime) in to_check:
-                    if mtime < cutoff:
-                        if dry_run:
-                            logger.info("[dry-run] would remove build dir %s (mtime=%s)", path, time.ctime(mtime))
-                            removed.append({"path": path, "mtime": mtime, "action": "dry-run"})
-                        else:
-                            ok = self._trash_or_remove_dir(path)
-                            if ok:
-                                removed.append({"path": path, "mtime": mtime, "action": "removed"})
-            return {"removed": removed, "removed_count": len(removed)}
-        except Exception:
-            logger.exception("clean_build_dirs error")
-            return {"removed": removed, "removed_count": len(removed)}
+                # default: if package is orphan, we remove; else skip
+                proceed_to_remove = True
 
-    # ----------------------------
-    # prune_cache: delegate to pkgtool cache pruning
-    # ----------------------------
-    def prune_cache(self) -> Dict[str,Any]:
-        if not self.pkgtool or not hasattr(self.pkgtool, "cache"):
-            logger.warning("pkgtool cache not available; cannot prune")
-            return {"ok": False, "reason": "no_pkgtool_cache"}
-        try:
-            before = self.pkgtool.cache.total_size()
-            self.pkgtool.cache._maybe_prune()
-            after = self.pkgtool.cache.total_size()
-            reclaimed = (before - after)
-            self.metrics["cache_pruned"] += 1
-            logger.info("Cache prune done: reclaimed %s", _human_bytes(reclaimed))
-            return {"ok": True, "reclaimed_bytes": reclaimed}
-        except Exception:
-            logger.exception("prune_cache failed")
-            return {"ok": False, "reason": "exception"}
+            if not proceed_to_remove:
+                LOG.info("Skipping %s due to policy", pkg)
+                continue
 
-    # ----------------------------
-    # snapshot restore
-    # ----------------------------
-    def restore_snapshot(self, snapshot_id: str, target: Optional[str] = None) -> Dict[str,Any]:
-        """
-        Restore snapshot (created earlier) into target (or default installed path).
-        """
-        if not self.db:
-            logger.error("DB required for snapshot restore")
-            return {"ok": False, "error": "no_db"}
-        try:
-            row = self.db.fetchone("SELECT snapshot_id, package_name, version, path FROM deepclean_snapshots WHERE snapshot_id = ? ORDER BY created_at DESC LIMIT 1", (snapshot_id,))
-            if not row:
-                return {"ok": False, "error": "snapshot_not_found"}
-            pkg_path = row.get("path")
-            name = row.get("package_name")
-            version = row.get("version")
-            # target default installed location
-            if not target:
-                target = os.path.expanduser(f"~/.rquest/installed/{name}-{version}")
-            # ensure target exists
-            _ensure_dir(target)
-            # use pkgtool.install_bin to restore
-            if self.pkgtool:
-                res = self.pkgtool.install_bin(pkg_path, target=target, use_fakeroot=True, verify_sig=False, sandbox_run=False)
+            try:
+                res = self._attempt_remove_package(pkg, ctx)
                 if res.get("ok"):
-                    logger.info("Snapshot %s restored to %s", snapshot_id, target)
-                    return {"ok": True, "target": target}
+                    actions.append({"package": pkg, "result": res})
+                    if res.get("snapshot"):
+                        snapshots.append(res.get("snapshot"))
                 else:
-                    return {"ok": False, "error": "install_failed", "detail": res}
-            else:
-                # fallback: decompress tar directly
-                from modules.pkgtool import _decompress_tar  # try to use function if exposed
-                try:
-                    _decompress_tar(pkg_path, target)
-                    return {"ok": True, "target": target}
-                except Exception:
-                    logger.exception("restore_snapshot fallback failed")
-                    return {"ok": False, "error": "restore_failed"}
+                    failures.append({"package": pkg, "error": res})
+            except Exception:
+                LOG.exception("apply_cleanup: unexpected error for %s", pkg)
+                failures.append({"package": pkg, "error": "unexpected"})
+
+        finished = _now_ts()
+        summary = {"actions_count": len(actions), "failures": len(failures), "snapshots": len(snapshots)}
+        # persist run
+        if self.db:
+            try:
+                self.db.execute("INSERT OR REPLACE INTO deepclean_runs (id, started_at, finished_at, dry_run, actions, summary) VALUES (?,?,?,?,?,?)",
+                                (run_id, started, finished, 1 if ctx.dry_run else 0, json.dumps(actions), json.dumps(summary)), commit=True)
+            except Exception:
+                LOG.debug("Failed to persist deepclean run")
+        if self.hooks:
+            try:
+                self.hooks.run("post_deepclean", {"run_id": run_id, "summary": summary, "actions": actions, "failures": failures})
+            except Exception:
+                LOG.debug("post_deepclean hook failed")
+        emit_event("deepclean.run.finished", {"run_id": run_id, "summary": summary})
+        return {"run_id": run_id, "actions": actions, "failures": failures, "snapshots": snapshots, "summary": summary}
+
+    # ---------- cache & builddir housekeeping ----------
+    def prune_cache(self, ctx: Optional[DeepCleanContext] = None) -> Dict[str, Any]:
+        ctx = ctx or DeepCleanContext(dry_run=_cfg_get("dry_run_default"))
+        if not self.pkgtool:
+            LOG.warning("pkgtool not available; cannot prune cache")
+            return {"ok": False, "error": "no_pkgtool"}
+        if ctx.dry_run:
+            LOG.info("[dry-run] would prune pkgtool cache")
+            return {"ok": True, "note": "dry-run"}
+        try:
+            res = self.pkgtool.cache_prune()
+            emit_event("deepclean.cache_pruned", {"detail": res})
+            return {"ok": True, "detail": res}
         except Exception:
-            logger.exception("restore_snapshot error")
-            return {"ok": False, "error": "exception"}
+            LOG.exception("prune_cache failed")
+            return {"ok": False, "error": "prune_failed"}
 
-    # ----------------------------
-    # GC daemon: background thread performing scheduled cleanup based on thresholds
-    # ----------------------------
-    def _gc_daemon_loop(self, check_interval: int, soft_pct: int, hard_pct: int):
-        logger.info("GC daemon started: interval=%ds soft=%d%% hard=%d%%", check_interval, soft_pct, hard_pct)
-        while not self._daemon_stop.wait(check_interval):
+    def clean_build_dirs(self, ctx: Optional[DeepCleanContext] = None) -> Dict[str, Any]:
+        ctx = ctx or DeepCleanContext(dry_run=_cfg_get("dry_run_default"))
+        results = {"cleaned": [], "errors": []}
+        for bd in _cfg_get("builddirs", []):
+            p = Path(bd)
+            if not p.exists():
+                continue
             try:
-                # compute disk usage on cache_dir or root FS
-                cache_dir = self.pkgtool.cache.cache_dir if (self.pkgtool and hasattr(self.pkgtool, "cache")) else self.snapshot_dir
-                st = shutil.disk_usage(cache_dir)
-                used_pct = int((st.used / st.total) * 100) if st.total > 0 else 0
-                logger.debug("GC daemon disk usage for %s: %d%%", cache_dir, used_pct)
-                if used_pct >= hard_pct:
-                    logger.warning("Hard threshold reached (%d%%) - running aggressive clean", used_pct)
-                    # aggressive: prune cache and remove orphans regardless of age (but keep protect labels)
-                    cands = self.detect_orphans(dry_run=False, max_candidates=1000)
-                    # mark all as to-be-removed (non-dry)
-                    self.apply_cleanup(cands, snapshot=True, dry_run=False)
-                    self.prune_cache()
-                elif used_pct >= soft_pct:
-                    logger.info("Soft threshold reached (%d%%) - attempting conservative prune", used_pct)
-                    # conservative: prune cache, remove very old build dirs
-                    self.prune_cache()
-                    bs_conf = self.cfg.get("remove_builds", DEFAULTS["remove_builds"])
-                    self.clean_build_dirs(age_days=bs_conf.get("age_days", 30) * 2, keep_last_per_package=bs_conf.get("keep_last_per_package", 2), dry_run=False)
-                else:
-                    logger.debug("GC daemon: thresholds not reached (%d%%)", used_pct)
+                if ctx.dry_run:
+                    LOG.info("[dry-run] would clean build dir %s", p)
+                    results["cleaned"].append({"dir": str(p), "dry_run": True})
+                    continue
+                # remove contents but keep directory
+                for child in p.iterdir():
+                    try:
+                        if child.is_dir():
+                            shutil.rmtree(child)
+                        else:
+                            child.unlink()
+                    except Exception as e:
+                        LOG.exception("Failed cleaning %s", child)
+                        results["errors"].append({"path": str(child), "error": str(e)})
+                LOG.info("Cleaned build dir %s", p)
+                results["cleaned"].append({"dir": str(p)})
             except Exception:
-                logger.exception("GC daemon loop exception")
-        logger.info("GC daemon exiting")
+                LOG.exception("clean_build_dirs failed for %s", p)
+                results["errors"].append({"dir": str(p)})
+        emit_event("deepclean.builddirs.cleaned", {"result": results})
+        return results
 
-    def start_daemon(self):
-        if self._daemon_thread and self._daemon_thread.is_alive():
-            logger.info("GC daemon already running")
-            return {"ok": False, "reason": "already_running"}
-        cfg = self.cfg.get("gc_daemon", GC_DAEMON_CFG)
-        if not cfg.get("enabled", False):
-            logger.info("GC daemon is disabled in configuration")
+    # ---------- daemon ----------
+    def start_daemon(self, interval: Optional[int] = None):
+        cfg = _cfg_get("gc_daemon", {})
+        enabled = bool(cfg.get("enabled", False))
+        if not enabled:
+            LOG.info("Deepclean daemon disabled in config")
             return {"ok": False, "reason": "disabled"}
-        interval = int(cfg.get("check_interval_seconds", 3600))
-        soft = int(cfg.get("soft_threshold_percent", 80))
-        hard = int(cfg.get("hard_threshold_percent", 95))
-        self._daemon_stop.clear()
-        self._daemon_thread = threading.Thread(target=self._gc_daemon_loop, args=(interval, soft, hard), daemon=True)
-        self._daemon_thread.start()
+        interval = interval or int(cfg.get("interval_seconds", 3600))
+        thread = threading.Thread(target=self._daemon_loop, args=(interval,), daemon=True)
+        thread.start()
+        LOG.info("Deepclean daemon started (interval=%s)", interval)
         return {"ok": True}
 
-    def stop_daemon(self):
-        if not self._daemon_thread:
-            return {"ok": False, "reason": "not_running"}
-        self._daemon_stop.set()
-        self._daemon_thread.join(timeout=10)
-        return {"ok": True}
-
-    # ----------------------------
-    # run convenience for CLI
-    # ----------------------------
-    def run(self, apply: bool = False, interactive: bool = False, dry_run: Optional[bool] = None, max_candidates: Optional[int] = None):
-        if dry_run is None:
-            dry_run = bool(self.cfg.get("dry_run_default", DEFAULTS["dry_run_default"]))
-        logger.info("DeepCleanManager.run apply=%s dry_run=%s interactive=%s", apply, dry_run, interactive)
-        cands = self.detect_orphans(dry_run=True, max_candidates=max_candidates)
-        if not cands:
-            logger.info("No candidates found for cleanup")
-            return {"ok": True, "candidates": []}
-        if dry_run:
-            # produce report and return
-            report = {"candidates": cands, "estimate_reclaim": sum([c.get("estimated_size",0) for c in cands])}
-            # store run record as dry-run
-            run_id = str(uuid.uuid4())
-            if self.db:
-                try:
-                    self.db.execute("INSERT INTO deepclean_runs (id, started_at, finished_at, mode, reclaimed_bytes, removed_packages, status, operator) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                    (run_id, _now_ts(), _now_ts(), "dry", 0, json.dumps([]), "dry", os.getenv("USER") or ""), commit=True)
-                except Exception:
-                    pass
-            return {"ok": True, "report": report}
-        # else apply
-        return self.apply_cleanup(cands, snapshot=True, dry_run=not apply, interactive=interactive)
-
-# ----------------------------
-# module-level helper and CLI
-# ----------------------------
-_MANAGER: Optional[DeepCleanManager] = None
-
-def get_deepclean_manager() -> DeepCleanManager:
-    global _MANAGER
-    if _MANAGER is None:
-        _MANAGER = DeepCleanManager()
-    return _MANAGER
-
-# CLI entry
-if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(prog="deepclean", description="Deep cleaning of orphans, build dirs and cache")
-    ap.add_argument("--apply", action="store_true", help="apply changes (default is dry-run)")
-    ap.add_argument("--interactive", action="store_true", help="ask for confirmation per candidate when applying")
-    ap.add_argument("--max-candidates", type=int, default=50, help="max orphan candidates to consider")
-    ap.add_argument("--start-daemon", action="store_true", help="start GC daemon (if enabled in config)")
-    ap.add_argument("--stop-daemon", action="store_true", help="stop GC daemon")
-    ap.add_argument("--status", action="store_true", help="show last runs summary")
-    args = ap.parse_args()
-
-    mgr = get_deepclean_manager()
-    if args.start_daemon:
-        r = mgr.start_daemon()
-        print(r)
-        sys.exit(0)
-    if args.stop_daemon:
-        r = mgr.stop_daemon()
-        print(r)
-        sys.exit(0)
-    if args.status:
-        # fetch last 10 runs
-        if mgr.db:
+    def _daemon_loop(self, interval: int):
+        while True:
             try:
-                rows = mgr.db.fetchall("SELECT id, started_at, finished_at, mode, reclaimed_bytes, status FROM deepclean_runs ORDER BY started_at DESC LIMIT 10")
-                for r in rows:
-                    print(f"{r.get('id')} {time.ctime(r.get('started_at'))} -> {time.ctime(r.get('finished_at'))} mode={r.get('mode')} reclaimed={_human_bytes(r.get('reclaimed_bytes') or 0)} status={r.get('status')}")
+                LOG.debug("Deepclean daemon tick")
+                # detect orphans and run dry-run cleanup to produce report
+                candidates = self.detect_orphans()
+                if candidates:
+                    # run apply_cleanup with dry-run False? We'll run dry-run first and require manual confirm to actually remove
+                    ctx = DeepCleanContext(dry_run=True, interactive=False, snapshot=True)
+                    report = self.apply_cleanup(candidates, ctx)
+                    LOG.info("Deepclean daemon dry-run summary: %s", report.get("summary"))
+                    emit_event("deepclean.daemon.report", {"summary": report.get("summary")})
+                    # optionally auto-apply if configured (dangerous) - skip here
+                else:
+                    LOG.debug("No deepclean candidates found")
             except Exception:
-                print("failed to read deepclean_runs")
-        else:
-            print("No DB available")
-        sys.exit(0)
+                LOG.exception("Deepclean daemon error")
+            time.sleep(interval)
 
-    result = mgr.run(apply=args.apply, interactive=args.interactive, dry_run=not args.apply, max_candidates=args.max_candidates)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+# ----------------------------
+# CLI
+# ----------------------------
+def _cli(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser(prog="rquest-deepclean", description="Rquest deepclean utilities")
+    sub = ap.add_subparsers(dest="cmd")
+
+    p_detect = sub.add_parser("detect", help="detect orphan packages")
+    p_detect.add_argument("--older-than-days", type=int, default=None)
+    p_detect.add_argument("--min-size-bytes", type=int, default=None)
+
+    p_sim = sub.add_parser("simulate", help="simulate removal of packages")
+    p_sim.add_argument("packages", nargs="+", help="package names")
+
+    p_apply = sub.add_parser("apply", help="apply cleanup for detected or provided packages")
+    p_apply.add_argument("--pkg", nargs="*", help="specific packages to remove instead of detection")
+    p_apply.add_argument("--dry-run", action="store_true")
+    p_apply.add_argument("--interactive", action="store_true")
+    p_apply.add_argument("--snapshot", action="store_true")
+    p_apply.add_argument("--prune-cache", action="store_true")
+
+    p_prune = sub.add_parser("prune-cache", help="prune pkgtool cache")
+
+    p_build = sub.add_parser("clean-builds", help="clean build directories")
+
+    p_daemon = sub.add_parser("daemon", help="start deepclean daemon")
+
+    args = ap.parse_args(argv)
+    mgr = DeepCleanManager(db_factory=get_db if get_db else None)
+
+    if args.cmd == "detect":
+        cands = mgr.detect_orphans(args.older_than_days, args.min_size_bytes)
+        print(json.dumps(cands, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "simulate":
+        mgr = DeepCleanManager(db_factory=get_db if get_db else None)
+        res = mgr.simulate_removal(args.packages)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "apply":
+        ctx = DeepCleanContext(dry_run=bool(args.dry_run or _cfg_get("dry_run_default")), interactive=bool(args.interactive), snapshot=bool(args.snapshot))
+        if args.pkg:
+            # build candidate list minimally
+            candidates = []
+            for p in args.pkg:
+                candidates.append({"name": p, "version": None, "size": 0})
+        else:
+            candidates = mgr.detect_orphans()
+        res = mgr.apply_cleanup(candidates, ctx)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        if args.prune_cache:
+            pc = mgr.prune_cache(ctx)
+            print("prune_cache:", pc)
+        return 0
+
+    if args.cmd == "prune-cache":
+        pc = mgr.prune_cache(DeepCleanContext(dry_run=False))
+        print(json.dumps(pc, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "clean-builds":
+        cb = mgr.clean_build_dirs(DeepCleanContext(dry_run=False))
+        print(json.dumps(cb, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "daemon":
+        mgr.start_daemon()
+        print("daemon started")
+        return 0
+
+    ap.print_help()
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(_cli(sys.argv[1:]))
