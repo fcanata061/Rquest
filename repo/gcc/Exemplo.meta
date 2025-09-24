@@ -1,0 +1,130 @@
+package:
+  name: example-package
+  version: 1.0.0
+  release: 1
+  description: "Exemplo de .meta com todas as opções suportadas pelo Rquest."
+  license: MIT
+  homepage: https://example.org
+  maintainer: "Exemplo Dev <dev@example.org>"
+
+source:
+  # Fontes múltiplas: http, ftp, git
+  - url: https://example.org/dist/example-1.0.0.tar.xz
+    sha256: deadbeef1234567890deadbeef1234567890deadbeef1234567890deadbeef
+  - url: ftp://ftp.example.org/pub/example/patch1.diff
+    sha256: 1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd
+  - git: https://github.com/example/example.git
+    branch: master
+    commit: abcdef1234567890abcdef1234567890abcdef12
+
+dependencies:
+  build:
+    - cmake
+    - ninja
+    - pkg-config
+  runtime:
+    - openssl
+    - zlib
+  exec:
+    - python >=3.11
+    - bash
+  compile:
+    - gcc
+    - make
+
+prepare:
+  steps:
+    - echo ">>> Aplicando patches"
+    - patch -p1 < ../patch1.diff
+    - autoreconf -fi
+  scripts:
+    - ./scripts/custom_prepare.sh
+
+build:
+  system: autotools
+  out_of_source: true
+  configure:
+    - --prefix=/usr
+    - --enable-shared
+    - --disable-static
+  make:
+    - all
+  install:
+    - install
+
+install:
+  fakeroot: true
+  paths:
+    - /usr/bin
+    - /usr/lib
+    - /usr/include
+    - /usr/share/doc/example
+  strip: true
+
+hooks:
+  pre-download:
+    - echo ">>> Verificando espaço em disco"
+  post-download:
+    - ./scripts/check_sources.sh
+  pre-build:
+    - echo ">>> Rodando testes antes da build"
+  post-build:
+    - make check
+  pre-install:
+    - echo ">>> Preparando sistema para instalação"
+  post-install:
+    - notify-send "example-package instalado com sucesso!"
+
+audit:
+  enabled: true
+  verify_checksums: true
+  verify_gpg: true
+  file_integrity: true
+  log_changes: true
+
+conflicts:
+  provides:
+    - example-alt
+  replaces:
+    - old-example
+  breaks:
+    - example-legacy < 0.9
+
+sandbox:
+  enabled: true
+  network: false
+  mounts:
+    - /dev
+    - /proc
+    - /sys
+  tmpfs:
+    - /tmp
+
+snapshots:
+  enabled: true
+  backend: btrfs
+  path: /var/lib/rquest/snapshots
+
+ml:
+  enabled: true
+  training_hints:
+    - "Detectar falhas de build comuns"
+    - "Otimizar flags de compilação"
+
+notifier:
+  enabled: true
+  methods:
+    - notify-send
+    - bar
+  show_update_count: true
+  frequency: daily
+
+metadata:
+  categories:
+    - development
+    - libraries
+  tags:
+    - example
+    - tutorial
+    - test
+  priority: optional
