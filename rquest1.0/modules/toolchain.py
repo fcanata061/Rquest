@@ -1,14 +1,15 @@
 # rquest1.0/modules/toolchain.py
 """
-Toolchain manager for Rquest — fully integrated with buildsystem and other modules.
+Toolchain manager for Rquest — fully integrated, functional and robust.
 
-- Reads .meta files (yaml/json)
-- Uses modules.buildsystem.build_package(pkg_meta, force=..., dry_run=..., shards=...)
-  (this is the canonical API from your buildsystem.py)
-- Snapshots before stages (btrfs if configured)
-- Registers results in DB if available
-- Fallback internal builder if buildsystem missing
-- CLI: bootstrap / list / discover / status / rebuild-world
+Responsibilities:
+ - discover toolchain .meta by tags (toolchain, pass1, pass2, pass3, final)
+ - orchestrate bootstrap stages (1..3 / final) using buildsystem
+ - snapshot support (btrfs preferred; lightweight marker fallback)
+ - record history in DB (if available)
+ - use sandbox/fakeroot/hooks/audit modules when present
+ - graceful fallback to internal minimal builder only if buildsystem absent
+ - CLI: bootstrap / list /discover /status /rebuild-world
 """
 
 from __future__ import annotations
@@ -25,30 +26,32 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# optional yaml loader
+# YAML optional
 try:
     import yaml  # type: ignore
 except Exception:
     yaml = None
 
-# ---------------------
-# integrate other modules (graceful)
-# ---------------------
+# ---------------------------
+# Integrations (graceful)
+# ---------------------------
+# config
 try:
     from modules.config import get_config  # type: ignore
 except Exception:
     def get_config():
         return {}
 
+# logging
 try:
     from modules.logging import get_logger  # type: ignore
     logger = get_logger("toolchain")
 except Exception:
-    logger = logging.getLogger("toolchain")
+    logger = logging.getLogger("rquest.toolchain")
     if not logger.handlers:
         logging.basicConfig(level=logging.INFO)
 
-# db support
+# db
 try:
     from modules.db import get_db, emit_event  # type: ignore
 except Exception:
@@ -57,7 +60,7 @@ except Exception:
     def emit_event(*a, **k):
         pass
 
-# buildsystem: expected API: build_package(pkg_meta: Dict, *, force=False, dry_run=False, shards=None) -> Dict
+# buildsystem (canonical)
 try:
     from modules.buildsystem import get_buildsystem  # type: ignore
     _HAVE_BUILDSYSTEM = True
@@ -65,7 +68,14 @@ except Exception:
     get_buildsystem = None  # type: ignore
     _HAVE_BUILDSYSTEM = False
 
-# sandbox & fakeroot (optional)
+# repo_sync
+try:
+    from modules.repo_sync import sync_all as repo_sync_all  # type: ignore
+except Exception:
+    def repo_sync_all(*a, **k):
+        return {"ok": False, "error": "repo_sync unavailable"}
+
+# sandbox & fakeroot & hooks & audit
 try:
     from modules.sandbox import get_sandbox_manager  # type: ignore
 except Exception:
@@ -77,14 +87,6 @@ try:
 except Exception:
     create_fakeroot = None
 
-# repo sync
-try:
-    from modules.repo_sync import sync_all as repo_sync_all  # type: ignore
-except Exception:
-    def repo_sync_all(*a, **k):
-        return {"ok": False, "error": "repo_sync unavailable"}
-
-# hooks and audit (optional)
 try:
     from modules.hooks import get_hook_manager  # type: ignore
 except Exception:
@@ -97,22 +99,23 @@ except Exception:
     def get_auditor():
         return None
 
-# ---------------------
-# config / defaults
-# ---------------------
+# ---------------------------
+# Config defaults
+# ---------------------------
 CFG = get_config() if callable(get_config) else {}
 TC_CFG = CFG.get("toolchain", {}) if isinstance(CFG, dict) else {}
-TOOLCHAINS_DIR = TC_CFG.get("toolchains_dir", os.path.expanduser("~/.rquest/toolchains"))
-BOOTSTRAP_BASE = TC_CFG.get("bootstrap_base", os.path.expanduser("~/.rquest/bootstrap"))
+TOOLCHAINS_DIR = Path(TC_CFG.get("toolchains_dir", os.path.expanduser("~/.rquest/toolchains")))
+BOOTSTRAP_BASE = Path(TC_CFG.get("bootstrap_base", os.path.expanduser("~/.rquest/bootstrap")))
 REPO_LOCAL = CFG.get("repos", {}).get("local") if isinstance(CFG.get("repos", {}), dict) else None
 SNAPSHOT_CFG = CFG.get("snapshots", {}) if isinstance(CFG, dict) else {}
 
-os.makedirs(TOOLCHAINS_DIR, exist_ok=True)
-os.makedirs(BOOTSTRAP_BASE, exist_ok=True)
+TOOLCHAINS_DIR.mkdir(parents=True, exist_ok=True)
+BOOTSTRAP_BASE.mkdir(parents=True, exist_ok=True)
+(Path(SNAPSHOT_CFG.get("path") or "/var/lib/rquest/snapshots")).mkdir(parents=True, exist_ok=True)
 
-# ---------------------
-# small helpers
-# ---------------------
+# ---------------------------
+# Helpers
+# ---------------------------
 def _uid() -> str:
     return uuid.uuid4().hex[:10]
 
@@ -120,7 +123,6 @@ def _now() -> int:
     return int(time.time())
 
 def _run(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str,str]] = None, timeout: Optional[int] = None) -> Tuple[int,str,str]:
-    """Run cmd returning (rc, stdout, stderr)."""
     try:
         p = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=(env or os.environ), text=True)
         out, err = p.communicate(timeout=timeout)
@@ -132,10 +134,10 @@ def _run(cmd: List[str], cwd: Optional[str] = None, env: Optional[Dict[str,str]]
     except Exception as e:
         return 1, "", str(e)
 
-def _read_meta(path: Path) -> Optional[Dict[str,Any]]:
+def _read_meta(path: Path) -> Optional[Dict[str, Any]]:
     try:
         txt = path.read_text(encoding="utf-8")
-        # try json first
+        # try json
         try:
             return json.loads(txt)
         except Exception:
@@ -148,9 +150,9 @@ def _read_meta(path: Path) -> Optional[Dict[str,Any]]:
     except Exception:
         return None
 
-# ---------------------
-# snapshot management (btrfs preferred)
-# ---------------------
+# ---------------------------
+# Snapshot functions
+# ---------------------------
 def create_snapshot(name_suffix: str) -> Optional[str]:
     base = SNAPSHOT_CFG.get("path") or "/var/lib/rquest/snapshots"
     os.makedirs(base, exist_ok=True)
@@ -164,7 +166,7 @@ def create_snapshot(name_suffix: str) -> Optional[str]:
             logger.info("Created btrfs snapshot: %s", snap_path)
             return snap_path
         logger.warning("btrfs snapshot failed: %s", err.strip())
-    # fallback: lightweight marker dir
+    # fallback: lightweight marker
     snap_dir = os.path.join(base, name)
     try:
         os.makedirs(snap_dir, exist_ok=True)
@@ -176,25 +178,16 @@ def create_snapshot(name_suffix: str) -> Optional[str]:
         logger.exception("Failed to create snapshot fallback")
         return None
 
-# ---------------------
-# fallback builder - best-effort when buildsystem not available
-# ---------------------
-def fallback_build(pkg_meta: Dict[str,Any], workdir: Optional[Path] = None, dry_run: bool=False) -> Dict[str,Any]:
-    """
-    Very small fallback that honors:
-      - pkg_meta['source'] list
-      - pkg_meta['prepare']['steps']
-      - pkg_meta['build']['steps'] or autotools configure+make
-      - pkg_meta['install']['steps']
-    Returns dict with ok True/False and details.
-    """
+# ---------------------------
+# Fallback builder (minimal)
+# ---------------------------
+def fallback_build(pkg_meta: Dict[str,Any], workdir: Optional[Path] = None, dry_run: bool = False) -> Dict[str,Any]:
     res: Dict[str,Any] = {"ok": False, "errors": [], "logs": []}
     work = workdir or Path(tempfile.mkdtemp(prefix="rquest-fallback-"))
     try:
         sources = pkg_meta.get("source") or []
         if isinstance(sources, dict):
             sources = [sources]
-        # download sources (basic)
         for s in sources:
             url = s.get("url") if isinstance(s, dict) else s
             if not url:
@@ -203,13 +196,17 @@ def fallback_build(pkg_meta: Dict[str,Any], workdir: Optional[Path] = None, dry_
             dest = work / fname
             if dest.exists():
                 continue
+            if dry_run:
+                logger.info("[dry-run] would fetch %s", url)
+                continue
             if shutil.which("wget"):
-                if dry_run:
-                    logger.info("[dry-run] would download %s", url)
-                else:
-                    rc, out, err = _run(["wget", "-c", "-O", str(dest), url], cwd=str(work))
-                    if rc != 0:
-                        res["errors"].append({"stage":"fetch","url":url,"err":err})
+                rc, out, err = _run(["wget", "-c", "-O", str(dest), url], cwd=str(work))
+            elif shutil.which("curl"):
+                rc, out, err = _run(["curl", "-L", "-o", str(dest), url], cwd=str(work))
+            else:
+                rc, out, err = 1, "", "no-downloader"
+            if rc != 0:
+                res["errors"].append({"stage":"fetch","url":url,"err":err})
         # prepare
         prepare = pkg_meta.get("prepare", {}) or {}
         for cmd in (prepare.get("steps") or []):
@@ -262,13 +259,13 @@ def fallback_build(pkg_meta: Dict[str,Any], workdir: Optional[Path] = None, dry_
         except Exception:
             pass
 
-# ---------------------
+# ---------------------------
 # ToolchainManager
-# ---------------------
+# ---------------------------
 class ToolchainManager:
     def __init__(self):
-        self.toolchains_dir = Path(TOOLCHAINS_DIR)
-        self.bootstrap_base = Path(BOOTSTRAP_BASE)
+        self.toolchains_dir = TOOLCHAINS_DIR
+        self.bootstrap_base = BOOTSTRAP_BASE
         self.repo_local = REPO_LOCAL
         self.cfg = CFG
         self.db = None
@@ -277,12 +274,13 @@ class ToolchainManager:
             self.db = dget() if dget else None
         except Exception:
             self.db = None
-        # buildsystem instance (object returned by get_buildsystem())
+        # buildsystem instance
         self.buildsystem = None
         if _HAVE_BUILDSYSTEM and callable(get_buildsystem):
             try:
                 self.buildsystem = get_buildsystem()
             except Exception:
+                logger.exception("get_buildsystem() failed; falling back to internal")
                 self.buildsystem = None
         # optional modules
         try:
@@ -302,41 +300,35 @@ class ToolchainManager:
     def _index_toolchains(self):
         self.index: Dict[str,Dict[str,Any]] = {}
         try:
-            idxf = self.toolchains_dir / "index.json"
+            idxf = Path(self.toolchains_dir) / "index.json"
             if idxf.exists():
                 data = json.loads(idxf.read_text(encoding="utf-8"))
                 for t in data.get("toolchains", []):
                     self.index[t.get("name")] = t
             else:
-                # scan directory
-                for d in self.toolchains_dir.iterdir():
+                # scan
+                for d in Path(self.toolchains_dir).iterdir():
                     if d.is_dir():
                         self.index[d.name] = {"name": d.name, "path": str(d)}
         except Exception:
-            logger.debug("Index toolchains load failed")
+            logger.debug("index_toolchains load failed")
 
     def discover_system_compilers(self) -> List[Dict[str,Any]]:
-        results: List[Dict[str,Any]] = []
-        candidates = ["gcc", "g++", "clang", "clang++"]
-        for c in candidates:
-            p = shutil.which(c)
+        nodes = []
+        for exe in ("gcc", "g++", "clang", "clang++"):
+            p = shutil.which(exe)
             if not p:
                 continue
             rc, out, err = _run([p, "--version"])
             ver = out.splitlines()[0] if out else None
-            results.append({"name": c, "path": p, "version": ver})
-        return results
+            nodes.append({"name": exe, "path": p, "version": ver})
+        return nodes
 
     def _find_metas_for_stage(self, stage_tag: str) -> List[Path]:
-        """
-        Walk local repo(s) and find .meta files matching 'toolchain' tag and stage_tag.
-        Heuristics: tags list or package name containing 'pass1' etc.
-        """
         metas: List[Path] = []
         candidates: List[Path] = []
         if self.repo_local:
             candidates.append(Path(self.repo_local))
-        # common fallbacks
         candidates += [Path("/var/lib/rquest/repos"), Path("/var/lib/rquest/local-repo"), Path.home() / ".rquest" / "local-repo"]
         for root in candidates:
             if not root or not root.exists():
@@ -346,7 +338,7 @@ class ToolchainManager:
                 if not parsed:
                     continue
                 tags = parsed.get("tags") or []
-                name = parsed.get("package", {}).get("name") or parsed.get("name") or p.stem
+                name = (parsed.get("package", {}) or {}).get("name") or parsed.get("name") or p.stem
                 cat = parsed.get("category") or ""
                 if ("toolchain" in tags or cat == "toolchain"):
                     if stage_tag in tags or stage_tag in name or (stage_tag == "final" and "pass" not in name):
@@ -358,72 +350,59 @@ class ToolchainManager:
     def _persist_history(self, name: str, stage: str, meta: str, ok: bool, details: Dict[str,Any]):
         try:
             if self.db:
-                # expect db wrapper with execute method
                 self.db.execute("CREATE TABLE IF NOT EXISTS toolchain_history (id TEXT PRIMARY KEY, name TEXT, stage TEXT, meta TEXT, ok INTEGER, ts INTEGER, details JSON)", (), commit=True)
                 recid = f"tch-{_uid()}"
-                self.db.execute("INSERT INTO toolchain_history (id, name, stage, meta, ok, ts, details) VALUES (?,?,?,?,?,?,?)", (recid, name, stage, meta, 1 if ok else 0, _now(), json.dumps(details)), commit=True)
+                self.db.execute("INSERT INTO toolchain_history (id, name, stage, meta, ok, ts, details) VALUES (?,?,?,?,?,?,?)",
+                                (recid, name, stage, meta, 1 if ok else 0, _now(), json.dumps(details)), commit=True)
         except Exception:
-            logger.debug("DB persist history failed")
+            logger.debug("DB persist_history failed")
 
     def _build_one_meta(self, meta_path: Path, *, profile: str = "balanced", dry_run: bool = False, force: bool = False, shards: Optional[int] = None) -> Dict[str,Any]:
-        """
-        Build a single .meta:
-          - parse .meta into pkg_meta (dict)
-          - if buildsystem available: call buildsystem.build_package(pkg_meta, force=force, dry_run=dry_run, shards=shards)
-          - else fallback_build(pkg_meta)
-        """
         logger.info("Building meta %s", meta_path)
         pkg_meta = _read_meta(meta_path)
         if not pkg_meta:
             return {"ok": False, "error": "invalid_meta"}
-        snap = create_snapshot(f"{meta_path.stem}") if SNAPSHOT_CFG else None
+        # snapshot before
+        snap = create_snapshot(meta_path.stem) if SNAPSHOT_CFG else None
         if self.buildsystem:
             try:
-                # call canonical API from buildsystem: build_package(pkg_meta, force=..., dry_run=..., shards=...)
+                # expected API: build_package(pkg_meta:Dict, *, force=False, dry_run=False, shards=None)
                 try:
                     res = self.buildsystem.build_package(pkg_meta, force=force, dry_run=dry_run, shards=shards)
                 except TypeError:
-                    # some buildsystems may accept different args; try fallback signatures
+                    # fallback: try fewer kwargs
                     res = self.buildsystem.build_package(pkg_meta, dry_run=dry_run)
                 ok = bool(res.get("ok"))
                 self._persist_history(meta_path.stem, profile, str(meta_path), ok, res)
                 return res
             except Exception as e:
-                logger.exception("buildsystem.build_package failed: %s", e)
-                # fallthrough to fallback
-        # fallback
+                logger.exception("buildsystem.build_package raised exception: %s", e)
+                # fall through to fallback builder
+        # fallback builder
         res = fallback_build(pkg_meta, dry_run=dry_run)
         ok = bool(res.get("ok"))
         self._persist_history(meta_path.stem, profile, str(meta_path), ok, res)
         return res
 
     def bootstrap(self, name: str = "toolchain", profile: str = "balanced", stages: int = 2, dry_run: bool = False, force: bool = False, shards: Optional[int] = None) -> Dict[str,Any]:
-        """
-        Execute bootstrap stages (1..3) in order.
-        Returns a record dict with steps/outcomes.
-        """
         rec: Dict[str,Any] = {"id": f"bootstrap-{_uid()}", "name": name, "profile": profile, "stages": stages, "started_at": _now(), "steps": []}
-        # sync repos first if available
+        # try repo sync
         try:
             repo_res = repo_sync_all()
             logger.debug("repo_sync result: %s", repo_res)
         except Exception:
             logger.debug("repo_sync not available")
-
         stage_map = {1: "pass1", 2: "pass2", 3: "pass3", 4: "final"}
         to_run = list(range(1, min(int(stages), 3) + 1))
         logger.info("Bootstrapping '%s' profile=%s stages=%s", name, profile, to_run)
-
-        # base snapshot
         base_snap = create_snapshot(f"{name}-pre") if SNAPSHOT_CFG else None
         rec["snapshot_before"] = base_snap
-
         for s in to_run:
             tag = stage_map.get(s, f"pass{s}")
-            logger.info("Running stage %s (%s)", s, tag)
+            logger.info("Stage %s (%s) start", s, tag)
             metas = self._find_metas_for_stage(tag)
             if not metas:
-                logger.warning("No metas for stage %s (%s), skipping", s, tag)
+                logger.warning("No metas for stage %s (%s) found, skipping", s, tag)
                 rec["steps"].append({"stage": s, "tag": tag, "skipped": True})
                 continue
             step_info = {"stage": s, "tag": tag, "items": []}
@@ -431,7 +410,7 @@ class ToolchainManager:
                 res = self._build_one_meta(meta, profile=profile, dry_run=dry_run, force=force, shards=shards)
                 step_info["items"].append({"meta": str(meta), "result": res})
                 if not res.get("ok") and not force:
-                    logger.error("Meta %s failed at stage %s. Aborting bootstrap.", meta, s)
+                    logger.error("Meta %s failed at stage %s; aborting", meta, s)
                     step_info["failed"] = True
                     rec["failed_at"] = {"stage": s, "meta": str(meta)}
                     rec["steps"].append(step_info)
@@ -442,56 +421,52 @@ class ToolchainManager:
                     if self.auditor:
                         self.auditor.audit_package_meta(str(meta))
                 except Exception:
-                    logger.debug("Auditor absent or audit failed")
+                    logger.debug("Auditor not available or failed for %s", meta)
             step_info["finished_at"] = _now()
             rec["steps"].append(step_info)
             logger.info("Stage %s finished", s)
-
-        # register resulting toolchain (directory placeholder)
+        # register toolchain
         final_dir = Path(TOOLCHAINS_DIR) / name
         final_dir.mkdir(parents=True, exist_ok=True)
         rec["registered"] = {"id": f"tc-{_uid()}", "name": name, "path": str(final_dir), "profile": profile, "created_at": _now()}
-
-        # persist registry (file + DB if available)
         try:
             idx_path = Path(TOOLCHAINS_DIR) / "index.json"
-            data = idx_path.exists() and json.loads(idx_path.read_text(encoding="utf-8")) or {"toolchains": []}
+            data = json.loads(idx_path.read_text(encoding="utf-8")) if idx_path.exists() else {"toolchains": []}
             data["toolchains"] = [t for t in data.get("toolchains", []) if t.get("name") != name]
             data["toolchains"].append(rec["registered"])
             idx_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
             if self.db:
                 try:
                     self.db.execute("CREATE TABLE IF NOT EXISTS toolchains (id TEXT PRIMARY KEY, name TEXT, path TEXT, profile TEXT, created_at INTEGER)", (), commit=True)
-                    self.db.execute("INSERT OR REPLACE INTO toolchains (id, name, path, profile, created_at) VALUES (?,?,?,?,?)", (rec["registered"]["id"], rec["registered"]["name"], rec["registered"]["path"], rec["registered"]["profile"], rec["registered"]["created_at"]), commit=True)
+                    self.db.execute("INSERT OR REPLACE INTO toolchains (id, name, path, profile, created_at) VALUES (?,?,?,?,?)",
+                                    (rec["registered"]["id"], rec["registered"]["name"], rec["registered"]["path"], rec["registered"]["profile"], rec["registered"]["created_at"]), commit=True)
                 except Exception:
-                    logger.debug("DB register toolchain failed")
+                    logger.debug("DB register failed")
         except Exception:
-            logger.exception("Failed persisting toolchain registry")
-
+            logger.exception("Failed persist toolchain registry")
         rec["finished_at"] = _now()
         emit_event("toolchain.bootstrap.finished", {"name": name, "id": rec.get("id")})
         return rec
 
     def list_toolchains(self) -> Dict[str,Any]:
         idx_path = Path(TOOLCHAINS_DIR) / "index.json"
-        data = idx_path.exists() and json.loads(idx_path.read_text(encoding="utf-8")) or {"toolchains": []}
+        data = json.loads(idx_path.read_text(encoding="utf-8")) if idx_path.exists() else {"toolchains": []}
         return {"ok": True, "toolchains": data.get("toolchains", [])}
 
     def status(self) -> Dict[str,Any]:
-        return {"ok": True, "toolchains": list(self.index.keys()), "system_compilers": self.discover_system_compilers()}
+        return {"ok": True, "indexed": list(self.index.keys()), "system_compilers": self.discover_system_compilers()}
 
-    def rebuild_world(self, *, dry_run: bool = False, force: bool = False):
-        """
-        Rebuild all installed packages using buildsystem. Expects db.get_installed_packages()
-        to return list of installed packages with 'meta_path' key.
-        """
+    def discover_system_compilers(self) -> List[Dict[str,Any]]:
+        return self.discover_system_compilers()
+
+    def rebuild_world(self, *, dry_run: bool = False, force: bool = False) -> Dict[str,Any]:
         if not self.db:
-            logger.error("DB unavailable: cannot query installed packages for rebuild")
+            logger.error("DB unavailable: cannot rebuild world")
             return {"ok": False, "error": "db-unavailable"}
         try:
             pkgs = self.db.fetchall("SELECT name, version, meta_path FROM installed_packages ORDER BY name") or []
         except Exception:
-            logger.exception("Failed fetching installed packages")
+            logger.exception("DB query failed")
             return {"ok": False, "error": "db-query-failed"}
         results = []
         for p in pkgs:
@@ -505,12 +480,12 @@ class ToolchainManager:
                 break
         return {"ok": True, "results": results}
 
-# ---------------------
-# CLI for toolchain manager
-# ---------------------
+# ---------------------------
+# CLI
+# ---------------------------
 def _cli(argv: Optional[List[str]] = None):
     import argparse
-    ap = argparse.ArgumentParser(prog="rquest-toolchain", description="Toolchain manager for Rquest")
+    ap = argparse.ArgumentParser(prog="rquest-toolchain", description="Rquest toolchain manager")
     ap.add_argument("action", nargs="?", choices=["bootstrap", "list", "discover", "status", "rebuild-world"], default="status")
     ap.add_argument("--name", "-n", default="toolchain")
     ap.add_argument("--profile", "-p", default="balanced")
