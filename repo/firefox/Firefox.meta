@@ -1,0 +1,115 @@
+package:
+  name: firefox
+  version: 128.3.1
+  release: 1
+  description: "Mozilla Firefox – navegador rápido, seguro e open source."
+  license: MPL-2.0
+  homepage: https://www.mozilla.org/firefox
+  maintainer: "Rquest Team <dev@rquest.org>"
+
+source:
+  - url: https://archive.mozilla.org/pub/firefox/releases/128.3.1/source/firefox-128.3.1.source.tar.xz
+    sha256: d41d8cd98f00b204e9800998ecf8427e  # ⚠️ Substituir pelo checksum real
+
+dependencies:
+  build:
+    - rust >=1.77
+    - cargo
+    - clang
+    - llvm
+    - nodejs
+    - python >=3.11
+    - yasm
+    - nasm
+    - cbindgen
+    - gtk3
+    - gtk4
+    - pkg-config
+    - autoconf
+    - unzip
+    - zip
+  runtime:
+    - dbus
+    - alsa-lib
+    - libx11
+    - libxrender
+    - libxt
+    - libxrandr
+    - libxdamage
+    - libxcomposite
+    - libxfixes
+    - libxext
+    - mesa
+    - nss
+    - nspr
+    - pango
+    - cairo
+    - gdk-pixbuf2
+    - glib2
+    - zlib
+  exec:
+    - bash
+    - python >=3.11
+  compile:
+    - gcc
+    - make
+
+prepare:
+  steps:
+    - echo ">>> Preparando build do Firefox"
+    - ./mach bootstrap --application-choice=browser
+
+build:
+  system: custom
+  commands:
+    - ./mach configure
+    - ./mach build -j$(nproc)
+
+install:
+  fakeroot: true
+  commands:
+    - ./mach install --prefix=/usr
+  paths:
+    - /usr/bin/firefox
+    - /usr/lib/firefox
+    - /usr/share/applications
+    - /usr/share/icons
+  strip: false
+
+hooks:
+  pre-build:
+    - echo ">>> Verificando toolchain antes de compilar"
+  post-build:
+    - ./mach test || true
+  post-install:
+    - update-desktop-database /usr/share/applications || true
+    - gtk-update-icon-cache /usr/share/icons/hicolor || true
+    - notify-send "Firefox instalado com sucesso!"
+
+audit:
+  enabled: true
+  verify_checksums: true
+  file_integrity: true
+
+conflicts:
+  provides:
+    - www-browser
+  replaces:
+    - iceweasel
+  breaks:
+    - firefox-esr < 115
+
+sandbox:
+  enabled: true
+  network: true
+  mounts:
+    - /dev
+    - /proc
+    - /sys
+  tmpfs:
+    - /tmp
+
+snapshots:
+  enabled: true
+  backend: btrfs
+  path: /var/lib/rquest/snapshots
