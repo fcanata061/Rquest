@@ -1,428 +1,265 @@
-# rquest1.0/modules/config.py
-# -*- coding: utf-8 -*-
 """
-Rquest configuration loader and manager.
-
-Features:
- - load from multiple config paths (system, distro, user, env override)
- - supports YAML (PyYAML) and JSON
- - merge precedence: defaults < /usr/lib/rquest/config.yaml < /etc/rquest/config.yaml < ~/.config/rquest/config.yaml < explicit path
- - provides runtime API: get_config(), get(section, default), reload(), save(path), init_logging()
- - light validation + defaults for important sections (database, build, upgrade, repos, logging, audit)
- - optional simple file watcher callback (polling)
- - designed to be safe to import from other modules
+config.py – Sistema de configuração central do Rquest
+-----------------------------------------------------
+Implementações e melhorias:
+1. Cache de configuração carregada e crua (raw) com controle de mtime.
+2. Logging de avisos em parsing e erros.
+3. Conversão automática de tamanhos humanos ("10MB" → 10485760).
+4. Validação estrita de campos desconhecidos com Pydantic (se disponível).
+5. Reload seguro sensível a modificações do arquivo.
+6. Suporte a seções por módulo (modules.<nome>).
+7. Função validate_config() para checagens adicionais.
+8. Parsing robusto: tenta YAML e depois JSON.
 """
-
-from __future__ import annotations
 
 import os
+import sys
 import json
-import time
+import yaml
 import logging
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Union
 from pathlib import Path
-from typing import Any, Dict, Optional, Callable, List
+from threading import RLock
+from copy import deepcopy
 
-# try YAML
 try:
-    import yaml  # type: ignore
-    YAML_AVAILABLE = True
-except Exception:
-    YAML_AVAILABLE = False
+    from pydantic import BaseModel, ValidationError, Extra
+    USE_PYDANTIC = True
+except ImportError:
+    USE_PYDANTIC = False
 
-_logger = logging.getLogger("rquest.config")
 
-# Default configuration (safe sensible defaults)
-_DEFAULTS: Dict[str, Any] = {
-    "database": {
-        "path": "/var/lib/rquest/db.sqlite3",
-        "timeout": 30,
-        "journal_mode": "WAL",
-        "synchronous": "NORMAL"
-    },
-    "build": {
-        "jobs": os.cpu_count() or 1,
-        "cflags": "-O2 -pipe",
-        "cxxflags": "-O2 -pipe",
-        "ldflags": "",
-        "prefix": "/usr",
-        "builddir": "/var/tmp/rquest/build",
-        "fakeroot": False,
-        "keep_build_dirs": False,
-        "cache_dir": "/var/cache/rquest/build"
-    },
-    "upgrade": {
-        "parallelism": 2,
-        "max_retries": 2,
-        "retry_backoff": 5,
-        "snapshot": {"backend": "btrfs", "path": "/var/lib/rquest/snapshots", "source": "/"},
-        "rollback_all_on_fail": False,
-        "dry_run": False,
-        "persist_runs_in_db": True,
-    },
-    "repos": {
-        "local": os.path.expanduser("~/.rquest/repos"),
-        "remotes": [],  # list of git/http endpoints
-        "metas_subpath": "",  # subpath inside repo where .meta files live
-    },
+# ========================
+# Utilidades
+# ========================
+
+def _human_size_to_bytes(value: Union[str, int]) -> int:
+    """Converte '10MB', '5G', '100K' → bytes inteiros"""
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        return 0
+    units = {"K": 1024, "M": 1024**2, "G": 1024**3}
+    value = value.strip().upper()
+    try:
+        if value[-1] in units:
+            return int(float(value[:-1]) * units[value[-1]])
+        return int(value)
+    except Exception:
+        logging.warning(f"[config] Valor inválido para tamanho: {value}, usando 0")
+        return 0
+
+
+def _merge_dicts(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """Mescla recursivamente dicionários"""
+    result = deepcopy(base)
+    for k, v in override.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _merge_dicts(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def _load_yaml_or_json_file(path: Path) -> Dict[str, Any]:
+    """Carrega arquivo YAML ou JSON com fallback robusto"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            if path.suffix in [".yaml", ".yml"]:
+                return yaml.safe_load(f) or {}
+            if path.suffix == ".json":
+                return json.load(f)
+            # tenta yaml primeiro
+            try:
+                return yaml.safe_load(f) or {}
+            except Exception:
+                f.seek(0)
+                return json.load(f)
+    except Exception as e:
+        logging.warning(f"[config] Falha ao carregar {path}: {e}")
+        return {}
+
+
+# ========================
+# Defaults
+# ========================
+
+DEFAULTS: Dict[str, Any] = {
     "logging": {
         "level": "INFO",
-        "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
-        "console": True,
-        "file": None,  # e.g. /var/log/rquest/rquest.log
+        "color": True,
+        "max_size": "10MB",
+        "follow_buffer": 1000,
     },
-    "audit": {
-        "paths": ["/usr", "/lib", "/etc", "/bin", "/sbin"],
-        "hash_algos": ["sha256"],
-        "check_permissions": True,
-        "check_owner": True,
-        "output_dir": os.path.expanduser("~/.rquest/audit_reports"),
+    "db": {
+        "path": "~/.rquest/db.sqlite3",
+        "backup": True,
     },
-    "daemon": {
-        "enabled": False,
+    "buildsystem": {
+        "default": "make",
+        "timeout": 300,
     },
-    "meta": {
-        "meta_cache_dir": os.path.expanduser("~/.rquest/meta_cache"),
-        "hooks_dir_name": "hooks",
-        "inherit_search_paths": ["./", "/usr/share/rquest/meta", "~/.rquest/overlays"]
+    "network": {
+        "retries": 3,
+        "timeout": 30,
+        "proxy": None,
     },
-    "pkgtool": {
-        "cache_dir": os.path.expanduser("~/.rquest/pkgcache"),
+    "resolver": {
+        "parallel": 4,
+        "cache": True,
     },
-    "toolchain": {
-        "bootstrap_dir": "/var/lib/rquest/toolchains",
+    "cli": {
+        "interactive": True,
+        "color": True,
     },
-    # UI/Notifier
-    "notifier": {
-        "notify_send": True,
-        "i3blocks": {"script": None},
-        "lemonbar": {"script": None}
-    }
+    "modules": {}  # configurações específicas por módulo
 }
 
-# Candidate config files (in load order; later ones override earlier).
-# Merge order: defaults <- /usr/lib <- /etc <- XDG_CONFIG_HOME/user <- explicit path passed to load()
-_CANDIDATE_PATHS = [
-    "/usr/lib/rquest/config.yaml",
-    "/etc/rquest/config.yaml",
-    os.path.join(os.getenv("XDG_CONFIG_HOME", os.path.expanduser("~/.config")), "rquest", "config.yaml"),
-    os.path.expanduser("~/.rquest/config.yaml"),
-]
 
-# Module-level singleton data
-_CONFIG: Dict[str, Any] = {}
-_CONFIG_PATHS_LOADED: List[str] = []
-_WATCHERS: List[Callable[[Dict[str, Any]], None]] = []
-_WATCH_POLL_INTERVAL = 2.0  # seconds
-_WATCH_THREAD = None
-_WATCH_STOP = False
+# ========================
+# Modelos
+# ========================
 
-# -----------------------
-# Utility helpers
-# -----------------------
-def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge b into a recursively and return result (new dict)."""
-    out = dict(a)
-    for k, v in b.items():
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
+if USE_PYDANTIC:
+    class ConfigModel(BaseModel, extra=Extra.forbid):
+        logging: Dict[str, Any] = {}
+        db: Dict[str, Any] = {}
+        buildsystem: Dict[str, Any] = {}
+        network: Dict[str, Any] = {}
+        resolver: Dict[str, Any] = {}
+        cli: Dict[str, Any] = {}
+        modules: Dict[str, Dict[str, Any]] = {}
 
-def _load_file(path: str) -> Optional[Dict[str, Any]]:
-    """Load YAML or JSON file. Returns dict or None."""
-    p = Path(path)
-    if not p.exists() or not p.is_file():
-        return None
-    try:
-        txt = p.read_text(encoding="utf-8")
-        # try yaml if available
-        if YAML_AVAILABLE:
-            try:
-                data = yaml.safe_load(txt)
-                if isinstance(data, dict):
-                    return data
-            except Exception:
-                _logger.debug("YAML parse failed for %s, falling back to JSON", path)
-        # fallback JSON
-        try:
-            data = json.loads(txt)
-            if isinstance(data, dict):
-                return data
-        except Exception:
-            _logger.warning("Failed to parse config file %s", path)
-            return None
-    except Exception:
-        _logger.exception("Failed to read config file %s", path)
-        return None
+else:
+    @dataclass
+    class ConfigModel:
+        logging: Dict[str, Any] = field(default_factory=dict)
+        db: Dict[str, Any] = field(default_factory=dict)
+        buildsystem: Dict[str, Any] = field(default_factory=dict)
+        network: Dict[str, Any] = field(default_factory=dict)
+        resolver: Dict[str, Any] = field(default_factory=dict)
+        cli: Dict[str, Any] = field(default_factory=dict)
+        modules: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
-def _normalize_paths(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Resolve some path entries to absolute expanded paths."""
-    c = dict(cfg)
-    # database.path
-    try:
-        dbp = c.get("database", {}).get("path")
-        if dbp:
-            c.setdefault("database", {})["path"] = os.path.abspath(os.path.expanduser(str(dbp)))
-    except Exception:
-        pass
-    # repo local
-    try:
-        rp = c.get("repos", {}).get("local")
-        if rp:
-            c.setdefault("repos", {})["local"] = os.path.abspath(os.path.expanduser(str(rp)))
-    except Exception:
-        pass
-    # build.cache_dir
-    try:
-        cd = c.get("build", {}).get("cache_dir")
-        if cd:
-            c.setdefault("build", {})["cache_dir"] = os.path.abspath(os.path.expanduser(str(cd)))
-    except Exception:
-        pass
-    # snapshot path
-    try:
-        sp = c.get("upgrade", {}).get("snapshot", {}).get("path")
-        if sp:
-            c.setdefault("upgrade", {})["snapshot"]["path"] = os.path.abspath(os.path.expanduser(str(sp)))
-    except Exception:
-        pass
-    return c
 
-# -----------------------
-# Core API
-# -----------------------
-def load(paths: Optional[List[str]] = None, explicit_path: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Load configuration merging defaults with files in _CANDIDATE_PATHS and optional explicit_path.
-    Returned dict is also stored in module-level get_config().
-    """
-    global _CONFIG, _CONFIG_PATHS_LOADED
-    cfg = dict(_DEFAULTS)  # start from defaults
-    paths_to_try = list(_CANDIDATE_PATHS)
-    if paths:
-        # custom candidate list
-        paths_to_try = paths_to_try + list(paths)
-    if explicit_path:
-        paths_to_try = paths_to_try + [explicit_path]
-    loaded = []
-    for p in paths_to_try:
-        try:
-            p = os.path.expanduser(str(p))
-            data = _load_file(p)
-            if data:
-                cfg = _deep_merge(cfg, data)
-                loaded.append(p)
-        except Exception:
-            _logger.exception("Failed loading config from %s", p)
-    cfg = _normalize_paths(cfg)
-    _CONFIG = cfg
-    _CONFIG_PATHS_LOADED = loaded
-    _logger.debug("Config loaded from: %s", loaded)
+# ========================
+# Loader
+# ========================
+
+_CONFIG: Optional[ConfigModel] = None
+_CONFIG_RAW: Optional[Dict[str, Any]] = None
+_CONFIG_LOCK = RLock()
+_CONFIG_PATH: Optional[Path] = None
+_CONFIG_MTIME: Optional[float] = None
+
+
+def _find_config_file() -> Optional[Path]:
+    """Localiza config.yaml/config.json"""
+    env = os.environ.get("RQUEST_CONFIG")
+    if env and Path(env).exists():
+        return Path(env)
+    for candidate in [
+        Path.cwd() / "config.yaml",
+        Path.cwd() / "config.json",
+        Path.home() / ".config/rquest/config.yaml",
+        Path("/etc/rquest/config.yaml"),
+    ]:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Normaliza tipos e valores"""
+    cfg = deepcopy(cfg)
+    if "logging" in cfg and "max_size" in cfg["logging"]:
+        cfg["logging"]["max_size"] = _human_size_to_bytes(cfg["logging"]["max_size"])
     return cfg
 
-def get_config() -> Dict[str, Any]:
-    """Return the active configuration dictionary (singleton)."""
-    global _CONFIG
-    if not _CONFIG:
-        load()
-    return _CONFIG
 
-def get(path: str, default: Any = None) -> Any:
-    """
-    Convenience getter for dotted path, e.g. get('database.path')
-    """
-    cfg = get_config()
-    parts = path.split(".")
-    cur = cfg
-    for p in parts:
-        if isinstance(cur, dict) and p in cur:
-            cur = cur[p]
+def _load_raw_config() -> Dict[str, Any]:
+    """Carrega configuração crua com cache de mtime"""
+    global _CONFIG_PATH, _CONFIG_MTIME, _CONFIG_RAW
+    path = _find_config_file()
+    if not path:
+        return {}
+    try:
+        mtime = path.stat().st_mtime
+        if _CONFIG_PATH == path and _CONFIG_MTIME == mtime and _CONFIG_RAW:
+            return _CONFIG_RAW
+        cfg = _load_yaml_or_json_file(path)
+        _CONFIG_PATH, _CONFIG_MTIME = path, mtime
+        _CONFIG_RAW = cfg
+        return cfg
+    except Exception as e:
+        logging.error(f"[config] Erro ao carregar {path}: {e}")
+        return {}
+
+
+def load_config(force: bool = False) -> ConfigModel:
+    """Carrega configuração mesclada com defaults"""
+    global _CONFIG, _CONFIG_RAW
+    with _CONFIG_LOCK:
+        if _CONFIG and not force:
+            return _CONFIG
+
+        raw = _load_raw_config()
+        merged = _merge_dicts(DEFAULTS, raw)
+        merged = _normalize_config(merged)
+        _CONFIG_RAW = merged
+
+        if USE_PYDANTIC:
+            try:
+                _CONFIG = ConfigModel(**merged)
+            except ValidationError as e:
+                logging.error(f"[config] Erro de validação: {e}")
+                sys.exit(1)
         else:
-            return default
-    return cur
+            _CONFIG = ConfigModel(**merged)
 
-def reload(explicit_path: Optional[str] = None) -> Dict[str, Any]:
-    """Reload configuration (useful for CLI tools to update runtime config)"""
-    return load(explicit_path=explicit_path)
+        return _CONFIG
 
-def save(path: Optional[str] = None) -> str:
-    """Persist current configuration to given path (yaml if available else json). Returns path saved."""
+
+def get_config() -> ConfigModel:
+    return load_config()
+
+
+def reload_config() -> ConfigModel:
+    return load_config(force=True)
+
+
+def validate_config() -> bool:
+    """Valida coerência da configuração atual"""
     cfg = get_config()
-    p = Path(path or _CONFIG_PATHS_LOADED[-1] if _CONFIG_PATHS_LOADED else os.path.expanduser("~/.rquest/config.yaml"))
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if YAML_AVAILABLE:
-        try:
-            p.write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
-            return str(p)
-        except Exception:
-            _logger.exception("Save YAML failed, falling back to JSON")
-    try:
-        p.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
-        return str(p)
-    except Exception:
-        _logger.exception("Failed to save config to %s", p)
-        raise
+    ok = True
 
-# -----------------------
-# Lightweight validation
-# -----------------------
-def validate(cfg: Optional[Dict[str, Any]] = None) -> List[str]:
-    """
-    Perform quick validations and return a list of warnings (empty if ok).
-    Not a strict schema validator, but checks presence and types of key fields.
-    """
-    warnings: List[str] = []
-    c = cfg or get_config()
-    # database.path
-    db = c.get("database")
-    if not db or not isinstance(db, dict):
-        warnings.append("database section missing or invalid; using defaults")
-    else:
-        if not db.get("path"):
-            warnings.append("database.path not set; using default")
-    # repos.local
-    repos = c.get("repos", {})
-    if repos and not repos.get("local"):
-        warnings.append("repos.local not set; recommended to set local repo path")
-    # build.jobs sanity
-    try:
-        jobs = int(c.get("build", {}).get("jobs", 1))
-        if jobs < 1:
-            warnings.append("build.jobs < 1; forcing to 1")
-            c.setdefault("build", {})["jobs"] = 1
-    except Exception:
-        warnings.append("build.jobs invalid; resetting to 1")
-        c.setdefault("build", {})["jobs"] = 1
-    # snapshot path writable check (if snapshot backend specified)
-    try:
-        sp = c.get("upgrade", {}).get("snapshot", {}).get("path")
-        if sp and not os.access(os.path.dirname(sp), os.W_OK):
-            warnings.append(f"upgrade.snapshot.path parent not writable: {sp}")
-    except Exception:
-        pass
-    return warnings
+    db_path = cfg.db.get("path")
+    if not isinstance(db_path, str):
+        logging.error("[config] db.path inválido (não é string)")
+        ok = False
 
-# -----------------------
-# Logging initialization helper
-# -----------------------
-def init_logging(cfg: Optional[Dict[str,Any]] = None):
-    """
-    Initialize python logging according to config.logging. This is safe to call multiple times.
-    Returns the root logger configured.
-    """
-    c = cfg or get_config()
-    log_cfg = c.get("logging", {}) if isinstance(c.get("logging", {}), dict) else {}
-    level_name = log_cfg.get("level", "INFO")
-    fmt = log_cfg.get("format", "%(asctime)s %(levelname)s %(name)s: %(message)s")
-    console = bool(log_cfg.get("console", True))
-    file_path = log_cfg.get("file")
-    level = getattr(logging, str(level_name).upper(), logging.INFO)
+    timeout = cfg.buildsystem.get("timeout", 0)
+    if not isinstance(timeout, int) or timeout <= 0:
+        logging.error("[config] buildsystem.timeout inválido")
+        ok = False
 
-    # root config
-    root = logging.getLogger()
-    # remove existing handlers to avoid duplicates on repeated init
-    for h in list(root.handlers):
-        root.removeHandler(h)
-    root.setLevel(level)
-    formatter = logging.Formatter(fmt)
-    if console:
-        ch = logging.StreamHandler()
-        ch.setLevel(level)
-        ch.setFormatter(formatter)
-        root.addHandler(ch)
-    if file_path:
-        try:
-            p = Path(file_path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            fh = logging.FileHandler(str(p), encoding="utf-8")
-            fh.setLevel(level)
-            fh.setFormatter(formatter)
-            root.addHandler(fh)
-        except Exception:
-            _logger.exception("failed to create log file handler %s", file_path)
-    _logger.debug("Logging initialized (level=%s file=%s console=%s)", level_name, file_path, console)
-    return root
+    return ok
 
-# -----------------------
-# Watcher (simple poll-based)
-# -----------------------
-def _watch_loop(poll: float = _WATCH_POLL_INTERVAL):
-    global _WATCH_STOP
-    last_mtimes: Dict[str, float] = {}
-    while not _WATCH_STOP:
-        try:
-            for p in _CONFIG_PATHS_LOADED:
-                try:
-                    st = Path(p).stat()
-                    m = st.st_mtime
-                except Exception:
-                    m = 0
-                if p not in last_mtimes:
-                    last_mtimes[p] = m
-                else:
-                    if m != last_mtimes[p]:
-                        last_mtimes[p] = m
-                        # reload config
-                        _logger.info("Config file changed, reloading: %s", p)
-                        reload(explicit_path=p)
-                        for cb in list(_WATCHERS):
-                            try:
-                                cb(get_config())
-                            except Exception:
-                                _logger.exception("Config watcher callback failed")
-        except Exception:
-            _logger.exception("config watch loop error")
-        time.sleep(poll)
 
-def watch(callback: Callable[[Dict[str,Any]], None], start_poll: bool = True):
-    """
-    Register a callback to be called when config files change.
-    If start_poll True, start a background poll thread (simple).
-    """
-    global _WATCH_THREAD, _WATCH_STOP
-    _WATCHERS.append(callback)
-    if start_poll and (_WATCH_THREAD is None or not _WATCH_THREAD.is_alive()):
-        _WATCH_STOP = False
-        import threading
-        _WATCH_THREAD = threading.Thread(target=_watch_loop, daemon=True)
-        _WATCH_THREAD.start()
-    return True
+# ========================
+# Funções helpers
+# ========================
 
-def stop_watch():
-    global _WATCH_STOP
-    _WATCH_STOP = True
+def get_logging_config() -> Dict[str, Any]:
+    return get_config().logging
 
-# -----------------------
-# Convenience getters for other modules
-# -----------------------
-def database_config() -> Dict[str,Any]:
-    return get("database", _DEFAULTS["database"])
+def get_db_path() -> str:
+    return os.path.expanduser(get_config().db.get("path"))
 
-def build_config() -> Dict[str,Any]:
-    return get("build", _DEFAULTS["build"])
+def get_buildsystem_config() -> Dict[str, Any]:
+    return get_config().buildsystem
 
-def upgrade_config() -> Dict[str,Any]:
-    return get("upgrade", _DEFAULTS["upgrade"])
-
-def repos_config() -> Dict[str,Any]:
-    return get("repos", _DEFAULTS["repos"])
-
-def logging_config() -> Dict[str,Any]:
-    return get("logging", _DEFAULTS["logging"])
-
-# -----------------------
-# Initialize module default config on import
-# -----------------------
-try:
-    load()
-except Exception:
-    _logger.exception("initial config load failed")
-
-# Set up logging early
-try:
-    init_logging(get_config())
-except Exception:
-    _logger.exception("init_logging failed")
-
-# End of config.py
+def get_module_config(module_name: str) -> Dict[str, Any]:
+    """Retorna config específica de um módulo"""
+    return get_config().modules.get(module_name, {})
