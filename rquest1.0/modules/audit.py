@@ -1,35 +1,35 @@
+#!/usr/bin/env python3
 # rquest1.0/modules/audit.py
 # -*- coding: utf-8 -*-
 """
-Rquest audit module — integridade, permissões e compliance.
+modules/audit.py — Auditoria de sistema: integridade de arquivos, logging e eventos.
 
-Features:
- - read config via modules.config (section "audit")
- - uses modules.db for installed_files and audit_runs
- - audit whole system or per-package (from .meta)
- - export reports: json, yaml, html (+ pdf via wkhtmltopdf if available)
- - audit daemon with optional realtime inotify
- - auto-fix skeleton using pkgtool/buildsystem with sandbox support
- - hooks integration: pre_audit, post_audit, on_integrity_fail, on_auto_fix
+Melhorias implementadas:
+ - Lê config via modules.config
+ - Integra com DB (migrations defensivas) e emit_event
+ - Hooks: pre_audit, on_audit_fail, post_audit
+ - Tipos de evento: new, checked, modified, missing, error
+ - Batch / paralelo (ThreadPoolExecutor)
+ - Incremental hashing (usa mtime+size para pular recálculo)
+ - cleanup_missing, audit_dir, audit_paths, export_audit_log, get_stats
+ - Retenção / purge de registros antigos configurável
 """
-
 from __future__ import annotations
+
 import os
 import sys
 import time
 import json
-import uuid
-import shutil
 import hashlib
 import logging
-import subprocess
-import tempfile
 import threading
-import html as _html
+import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from datetime import datetime, timedelta
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- integrations (graceful fallbacks) ---
+# Defensive imports from project
 try:
     from modules.config import get_config  # type: ignore
 except Exception:
@@ -38,749 +38,548 @@ except Exception:
 
 try:
     from modules.logging import get_logger  # type: ignore
-    logger = get_logger("audit")
+    LOG = get_logger("audit")
 except Exception:
-    logger = logging.getLogger("rquest.audit")
-    if not logger.handlers:
+    LOG = logging.getLogger("rquest.audit")
+    if not LOG.handlers:
         logging.basicConfig(level=logging.INFO)
 
 try:
     from modules.db import get_db, emit_event  # type: ignore
 except Exception:
-    def get_db():
-        return None
+    get_db = None
     def emit_event(*a, **k):
         pass
-
-try:
-    from modules.meta import MetaLoader  # type: ignore
-except Exception:
-    MetaLoader = None
-
-try:
-    from modules.pkgtool import get_pkgtool  # type: ignore
-except Exception:
-    get_pkgtool = None
-
-try:
-    from modules.buildsystem import get_buildsystem  # type: ignore
-except Exception:
-    get_buildsystem = None
 
 try:
     from modules.hooks import get_hook_manager  # type: ignore
 except Exception:
     get_hook_manager = None
 
+# Configuration defaults and normalization
+_CFG = get_config() if callable(get_config) else {}
+_AUDIT_CFG = _CFG.get("audit", {}) if isinstance(_CFG, dict) else {}
+
+DEFAULTS = {
+    "enabled": True,
+    "parallel_workers": 4,
+    "retention_days": 90,
+    "audit_table": "audit_log",
+    "max_path_length": 1024,
+    "hash_block_size": 65536,
+    "skip_if_unchanged_seconds": 3600,  # if file mtime+size unchanged within 1 hour, skip rehash
+    "log_level": "INFO",
+    "report_dir": "/var/lib/rquest/audit_reports",
+    "dry_run_default": False,
+}
+
+def _cfg_get(key: str, default=None):
+    return _AUDIT_CFG.get(key, DEFAULTS.get(key, default))
+
+# Ensure report dir exists
+REPORT_DIR = Path(_cfg_get("report_dir"))
 try:
-    from modules.sandbox import get_sandbox_manager  # type: ignore
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
 except Exception:
-    get_sandbox_manager = None
+    pass
 
-try:
-    from modules.deepclean import get_deepcleaner  # type: ignore
-except Exception:
-    get_deepcleaner = None
+# DB DDL
+_AUDIT_TABLE = _cfg_get("audit_table", "audit_log")
+_SCHEMA_DDL = f"""
+CREATE TABLE IF NOT EXISTS {_AUDIT_TABLE} (
+    path TEXT PRIMARY KEY,
+    sha256 TEXT,
+    size INTEGER,
+    mtime INTEGER,
+    created_at INTEGER,
+    last_checked INTEGER,
+    event_type TEXT,
+    notes TEXT
+);
+"""
+# optional index for retention queries
+_INDEX_DDL = f"CREATE INDEX IF NOT EXISTS idx_audit_last_checked ON {_AUDIT_TABLE}(last_checked);"
 
-# optional libs
-try:
-    import yaml  # type: ignore
-    YAML_AVAILABLE = True
-except Exception:
-    YAML_AVAILABLE = False
-
-_INOTIFY_AVAILABLE = False
-try:
-    import inotify.adapters  # type: ignore
-    _INOTIFY_AVAILABLE = True
-except Exception:
-    _INOTIFY_AVAILABLE = False
-
-_WKHTMLTOPDF = bool(shutil.which("wkhtmltopdf"))
-
-# -------------------------
-# Utilities
-# -------------------------
+# Utility functions
 def _now_ts() -> int:
     return int(time.time())
 
-def _uid(prefix: str = "") -> str:
-    import uuid
-    return f"{prefix}{uuid.uuid4().hex[:8]}"
+def _iso_now() -> str:
+    return datetime.utcnow().isoformat() + "Z"
 
-def _sha256_file(path: str) -> Optional[str]:
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None
+def _normalize_path(p: str) -> str:
+    return os.path.normpath(str(p))
 
-def _ensure_dir(p: str):
-    try:
-        Path(p).mkdir(parents=True, exist_ok=True)
-    except Exception:
-        pass
+def _sha256_file(path: str, block_size: int = None) -> str:
+    block_size = block_size or int(_cfg_get("hash_block_size", 65536))
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(block_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
-# -------------------------
-# Load config
-# -------------------------
-CFG = get_config() if callable(get_config) else {}
-AUDIT_CFG = CFG.get("audit", {}) if isinstance(CFG, dict) else {}
-
-DEFAULTS = {
-    "paths": ["/usr", "/lib", "/etc", "/bin", "/sbin"],
-    "hash_algos": ["sha256"],
-    "check_permissions": True,
-    "check_owner": True,
-    "critical_packages": ["rquest", "glibc", "systemd"],
-    "output_dir": os.path.expanduser("~/.rquest/audit_reports"),
-    "daemon": {"enabled": False, "interval_seconds": 3600, "realtime": False, "monitor_paths": ["/usr", "/lib", "/etc"]},
-    "auto_fix": {"enabled": False, "allowed": False, "preview": True},
-    "report_formats": ["json", "yaml", "html"],
-}
-def _acfg(k, default=None):
-    return AUDIT_CFG.get(k, DEFAULTS.get(k, default))
-
-AUDIT_PATHS: List[str] = _acfg("paths")
-HASH_ALGOS: List[str] = list(_acfg("hash_algos"))
-CHECK_PERMS: bool = bool(_acfg("check_permissions"))
-CHECK_OWNER: bool = bool(_acfg("check_owner"))
-CRITICAL_PACKAGES: List[str] = _acfg("critical_packages")
-REPORT_DIR: str = _acfg("output_dir")
-DAEMON_CFG = _acfg("daemon")
-AUTO_FIX_CFG = _acfg("auto_fix")
-_report_formats = _acfg("report_formats", ["json"])
-
-_ensure_dir(REPORT_DIR)
-
-# -------------------------
-# Data models
-# -------------------------
-class AuditFinding:
-    def __init__(self, kind: str, path: str, package: Optional[str], details: Dict[str,Any], severity: str = "warn"):
-        self.id = str(uuid.uuid4())
-        self.kind = kind  # 'missing', 'modified', 'extra', 'perm', 'owner', 'policy'
-        self.path = os.path.normpath(path)
-        self.package = package
-        self.details = details
-        self.severity = severity
-        self.ts = _now_ts()
-
-    def to_dict(self):
-        return {
-            "id": self.id,
-            "kind": self.kind,
-            "path": self.path,
-            "package": self.package,
-            "details": self.details,
-            "severity": self.severity,
-            "ts": self.ts,
-        }
-
-class AuditReport:
-    def __init__(self, run_id: Optional[str] = None):
-        self.run_id = run_id or str(uuid.uuid4())
-        self.started_at = _now_ts()
-        self.findings: List[AuditFinding] = []
-        self.metadata: Dict[str,Any] = {}
-        self.finished_at: Optional[int] = None
-
-    def add(self, f: AuditFinding):
-        self.findings.append(f)
-
-    def finish(self):
-        self.finished_at = _now_ts()
-
-    def to_dict(self):
-        return {
-            "run_id": self.run_id,
-            "started_at": self.started_at,
-            "finished_at": self.finished_at,
-            "findings": [f.to_dict() for f in self.findings],
-            "metadata": self.metadata,
-        }
-
-# -------------------------
-# Auditor implementation
-# -------------------------
+# Auditor class
 class Auditor:
-    def __init__(self, cfg: Optional[Dict[str,Any]] = None):
-        self.cfg = cfg or AUDIT_CFG
-        dbc = get_db() if callable(get_db) else None
-        self.db = (dbc() if callable(dbc) else None) if dbc else None
-        self.meta_loader = MetaLoader() if MetaLoader else None
-        self.pkgtool = (get_pkgtool()() if callable(get_pkgtool) else None) if get_pkgtool else None
-        self.buildsystem = (get_buildsystem()() if callable(get_buildsystem) else None) if get_buildsystem else None
-        self.hookmgr = (get_hook_manager()() if callable(get_hook_manager) else None) if get_hook_manager else None
-        self.sandboxmgr = (get_sandbox_manager()() if callable(get_sandbox_manager) else None) if get_sandbox_manager else None
-        self.deepclean = (get_deepcleaner()() if callable(get_deepcleaner) else None) if get_deepcleaner else None
-        self.paths = AUDIT_PATHS
-        self.hash_algos = HASH_ALGOS
-        self.crit_pkgs = CRITICAL_PACKAGES
-        self.output_dir = REPORT_DIR
-        self.auto_fix_cfg = AUTO_FIX_CFG
+    def __init__(self, db_factory=None):
+        """
+        Auditor reads config and sets up DB/tables and hooks.
+        db_factory: optional callable returning DB connection (for testing)
+        """
+        self.enabled = bool(_cfg_get("enabled", True))
+        self.parallel_workers = int(_cfg_get("parallel_workers", 4))
+        self.retention_days = int(_cfg_get("retention_days", 90))
+        self.skip_if_unchanged_seconds = int(_cfg_get("skip_if_unchanged_seconds", 3600))
+        self.hash_block_size = int(_cfg_get("hash_block_size", 65536))
+        self._lock = threading.RLock()
 
-        # ensure DB tables exist
+        # logging level
+        try:
+            lvl = getattr(logging, str(_cfg_get("log_level", "INFO")).upper(), logging.INFO)
+            LOG.setLevel(lvl)
+        except Exception:
+            pass
+
+        # DB
+        self.db = None
+        if db_factory and callable(db_factory):
+            try:
+                self.db = db_factory()
+            except Exception:
+                LOG.debug("audit: db_factory failed", exc_info=True)
+                self.db = None
+        elif get_db:
+            try:
+                self.db = get_db()()
+            except Exception:
+                LOG.debug("audit: get_db init failed", exc_info=True)
+                self.db = None
+
         if self.db:
             try:
-                self.db.execute("""
-                    CREATE TABLE IF NOT EXISTS installed_files (
-                        id TEXT PRIMARY KEY,
-                        package TEXT,
-                        version TEXT,
-                        path TEXT,
-                        sha256 TEXT,
-                        mode INTEGER,
-                        uid INTEGER,
-                        gid INTEGER
-                    )
-                """, (), commit=True)
-                self.db.execute("""
-                    CREATE TABLE IF NOT EXISTS audit_runs (
-                        id TEXT PRIMARY KEY,
-                        started_at INTEGER,
-                        finished_at INTEGER,
-                        findings_count INTEGER,
-                        metadata TEXT
-                    )
-                """, (), commit=True)
+                # create table(s)
+                try:
+                    self.db.execute(_SCHEMA_DDL, (), commit=True)
+                except TypeError:
+                    # some DB wrappers expect execute(sql) only
+                    try:
+                        self.db.execute(_SCHEMA_DDL)
+                        self.db.commit()
+                    except Exception:
+                        LOG.debug("audit: fallback DDL execution failed", exc_info=True)
+                try:
+                    self.db.execute(_INDEX_DDL, (), commit=True)
+                except Exception:
+                    pass
             except Exception:
-                logger.exception("Failed ensure audit DB tables")
+                LOG.exception("audit: failed to ensure schema")
 
-    def _load_installed_files_map(self) -> Dict[str, Dict[str,Any]]:
-        mapping: Dict[str, Dict[str,Any]] = {}
-        if self.db:
+        # hooks
+        self.hooks = None
+        if get_hook_manager:
             try:
-                rows = self.db.fetchall("SELECT package, version, path, sha256, mode, uid, gid FROM installed_files")
-                for r in rows:
-                    p = os.path.normpath(r.get("path"))
-                    mapping[p] = {
-                        "package": r.get("package"),
-                        "version": r.get("version"),
-                        "sha256": r.get("sha256"),
-                        "mode": r.get("mode"),
-                        "uid": r.get("uid"),
-                        "gid": r.get("gid"),
-                    }
-                logger.debug("Loaded %d installed files from DB", len(mapping))
-                return mapping
+                self.hooks = get_hook_manager()()
             except Exception:
-                logger.exception("Failed to load installed_files from DB")
-        # fallback: scan manifests in ~/.rquest/installed/
-        base = Path.home() / ".rquest" / "installed"
-        if base.exists():
-            for entry in base.iterdir():
-                if entry.is_dir():
-                    mf = entry / "MANIFEST.json"
-                    if mf.exists():
-                        try:
-                            j = json.loads(mf.read_text(encoding="utf-8"))
-                            for f in j.get("files", []):
-                                abs_path = os.path.normpath(str(Path("/") / f.get("path").lstrip("/")))
-                                mapping[abs_path] = {
-                                    "package": j.get("name"),
-                                    "version": j.get("version"),
-                                    "sha256": f.get("sha256"),
-                                    "mode": f.get("mode"),
-                                    "uid": f.get("uid"),
-                                    "gid": f.get("gid"),
-                                }
-                        except Exception:
-                            logger.exception("Failed parse manifest %s", mf)
-        return mapping
+                LOG.debug("audit: hooks init failed", exc_info=True)
+                self.hooks = None
 
-    def _check_file(self, path: str, record: Optional[Dict[str,Any]]) -> List[AuditFinding]:
-        findings: List[AuditFinding] = []
+    # Internal DB helpers (defensive)
+    def _db_fetchone(self, sql: str, params: Tuple = ()):
+        if not self.db:
+            return None
+        try:
+            r = self.db.fetchone(sql, params)
+            return dict(r) if r else None
+        except Exception:
+            LOG.debug("audit: db.fetchone failed", exc_info=True)
+            return None
+
+    def _db_execute(self, sql: str, params: Tuple = (), commit: bool = True):
+        if not self.db:
+            return False
+        try:
+            # many DB wrappers accept commit kw
+            try:
+                self.db.execute(sql, params, commit=commit)
+            except TypeError:
+                self.db.execute(sql, params)
+                if commit:
+                    try:
+                        self.db.commit()
+                    except Exception:
+                        pass
+            return True
+        except Exception:
+            LOG.exception("audit: db.execute failed: %s", sql)
+            return False
+
+    # Public API -------------------------------------------------
+    def verify_file_integrity(self, fname: str, force: bool = False, dry_run: Optional[bool] = None) -> bool:
+        """
+        Verify a single file's integrity.
+        - If no DB present, returns True (auditing disabled fallback).
+        - Uses incremental hashing: if size+mtime equal DB values and not forced, skips rehash.
+        - Records or updates record in audit table.
+        Returns True if file is 'ok' (matches recorded hash or recorded if new), False otherwise.
+        Emits events and calls hooks when discrepancies found.
+        """
+        dry_run = bool(_cfg_get("dry_run_default", False)) if dry_run is None else bool(dry_run)
+        if not self.enabled:
+            LOG.debug("audit disabled by config")
+            return True
+        path = _normalize_path(fname)
+        if len(path) > int(_cfg_get("max_path_length", 1024)):
+            LOG.warning("audit: path too long, skipping: %s", path)
+            return True
+
         if not os.path.exists(path):
-            sev = "critical" if record and record.get("package") in self.crit_pkgs else "high"
-            findings.append(AuditFinding("missing", path, record.get("package") if record else None, {"note": "file missing"}, severity=sev))
-            # hook
-            try:
-                if self.hookmgr:
-                    self.hookmgr.run("on_integrity_fail", {"path": path, "package": record.get("package") if record else None})
-            except Exception:
-                logger.debug("hook on_integrity_fail failed")
-            return findings
-
-        checksums: Dict[str,Optional[str]] = {}
-        if "sha256" in self.hash_algos:
-            checksums["sha256"] = _sha256_file(path)
-        # compare
-        if record:
-            expected = record.get("sha256")
-            if expected and checksums.get("sha256") and expected != checksums.get("sha256"):
-                sev = "critical" if record.get("package") in self.crit_pkgs else "high"
-                findings.append(AuditFinding("modified", path, record.get("package"), {"expected_sha256": expected, "actual_sha256": checksums.get("sha256")}, severity=sev))
-        else:
-            # file not tracked => extra
-            findings.append(AuditFinding("extra", path, None, {"note": "file not tracked in DB", "checksums": checksums}, severity="info"))
-
-        # permissions / ownership
-        try:
-            st = os.stat(path)
-            if record:
-                rmode = record.get("mode")
-                ruid = record.get("uid")
-                rgid = record.get("gid")
-                if CHECK_PERMS and rmode is not None:
-                    if int(rmode) != (st.st_mode & 0o777):
-                        findings.append(AuditFinding("perm", path, record.get("package"), {"expected": rmode, "actual": oct(st.st_mode & 0o777)}, severity="warn"))
-                if CHECK_OWNER and ruid is not None and rgid is not None:
-                    if int(ruid) != st.st_uid or int(rgid) != st.st_gid:
-                        findings.append(AuditFinding("owner", path, record.get("package"), {"expected_uid": ruid, "expected_gid": rgid, "actual_uid": st.st_uid, "actual_gid": st.st_gid}, severity="warn"))
-        except Exception:
-            logger.exception("Stat failed for %s", path)
-
-        return findings
-
-    def run_audit(self, paths: Optional[List[str]] = None, deep: bool = False, auto_fix: bool = False, compliance_profile: Optional[str] = None) -> AuditReport:
-        run_id = _uid("audit-")
-        report = AuditReport(run_id)
-        # pre hook
-        try:
-            if self.hookmgr:
-                self.hookmgr.run("pre_audit", {"run_id": run_id, "deep": deep})
-        except Exception:
-            logger.debug("pre_audit hook failed")
-        mapping = self._load_installed_files_map()
-        scanned = 0
-
-        if deep:
-            scan_paths = paths or self.paths
-            for root in scan_paths:
-                if not os.path.exists(root):
-                    continue
-                for dirpath, _, files in os.walk(root):
-                    for fn in files:
-                        p = os.path.join(dirpath, fn)
-                        rec = mapping.get(os.path.normpath(p))
-                        findings = self._check_file(p, rec)
-                        for f in findings:
-                            report.add(f)
-                        scanned += 1
-        else:
-            for p, rec in mapping.items():
-                findings = self._check_file(p, rec)
-                for f in findings:
-                    report.add(f)
-                scanned += 1
-
-        # compliance checks (simple skeleton)
-        if compliance_profile:
-            try:
-                comp = self._check_compliance(compliance_profile)
-                for f in comp:
-                    report.add(f)
-            except Exception:
-                logger.exception("Compliance check failed")
-
-        # critical packages validation
-        try:
-            crits = self._check_critical_packages(mapping)
-            for f in crits:
-                report.add(f)
-        except Exception:
-            logger.exception("Critical package check failed")
-
-        report.metadata.update({"scanned": scanned, "paths": paths or self.paths, "deep": deep})
-        report.finish()
-
-        # persist run
-        if self.db:
-            try:
-                self.db.execute("INSERT OR REPLACE INTO audit_runs (id, started_at, finished_at, findings_count, metadata) VALUES (?,?,?,?,?)",
-                                (report.run_id, report.started_at, report.finished_at, len(report.findings), json.dumps(report.metadata)), commit=True)
-            except Exception:
-                logger.exception("Failed to persist audit run")
-
-        # post hook
-        try:
-            if self.hookmgr:
-                self.hookmgr.run("post_audit", {"run_id": run_id, "report": report.to_dict()})
-        except Exception:
-            logger.debug("post_audit hook failed")
-
-        # optionally auto fix
-        if auto_fix and self.auto_fix_cfg.get("enabled", False):
-            try:
-                self.attempt_auto_fix(report)
-            except Exception:
-                logger.exception("Auto-fix failed")
-
-        # emit event
-        emit_event("audit.run.finished", {"run_id": run_id, "findings": len(report.findings)})
-        return report
-
-    def audit_package(self, meta_path: str) -> AuditReport:
-        if not self.meta_loader:
-            raise RuntimeError("MetaLoader not available")
-        mp = self.meta_loader.load(meta_path)
-        pkg_name = mp.name
-        report = AuditReport(_uid("audit-pkg-"))
-        try:
-            if self.hookmgr:
-                self.hookmgr.run("pre_audit", {"package": pkg_name})
-        except Exception:
-            logger.debug("pre_audit hook failed")
-        # get list of files from DB manifest (prefer) else from mp.raw["files"]
-        mapping = self._load_installed_files_map()
-        files = []
-        # If meta contains 'files' field, use it; else use installed_files mapping
-        mfiles = mp.raw.get("files") if isinstance(mp.raw, dict) else None
-        if mfiles:
-            for f in mfiles:
-                p = os.path.normpath(str(Path("/") / f.get("path").lstrip("/")))
-                rec = mapping.get(p)
-                findings = self._check_file(p, rec)
-                for fd in findings:
-                    report.add(fd)
-        else:
-            # check DB entries for this package
-            for p, rec in mapping.items():
-                if rec.get("package") == pkg_name:
-                    for fd in self._check_file(p, rec):
-                        report.add(fd)
-
-        report.finish()
-        try:
-            if self.hookmgr:
-                self.hookmgr.run("post_audit", {"package": pkg_name, "report": report.to_dict()})
-        except Exception:
-            logger.debug("post_audit hook failed")
-        emit_event("audit.package.finished", {"package": pkg_name, "findings": len(report.findings)})
-        return report
-
-    # basic compliance skeleton
-    def _check_compliance(self, profile: str) -> List[AuditFinding]:
-        findings: List[AuditFinding] = []
-        # Example for 'cis' profile
-        if profile == "cis":
-            if not os.path.exists("/etc/passwd"):
-                findings.append(AuditFinding("policy", "/etc/passwd", None, {"rule": "exists"}, severity="critical"))
-            # check that sshd is active (best-effort)
-            if shutil.which("systemctl"):
+            LOG.warning("audit: file missing: %s", path)
+            # mark missing in DB
+            self._record_event(path, sha256=None, size=None, mtime=None, event_type="missing", notes="file-missing")
+            emit_event("audit.file.missing", {"path": path})
+            if self.hooks:
                 try:
-                    rc = subprocess.call(["systemctl", "is-active", "--quiet", "sshd"])
-                    if rc != 0:
-                        findings.append(AuditFinding("policy", "service:sshd", None, {"rule": "service_active"}, severity="warn"))
+                    self.hooks.run("on_audit_missing", {"path": path})
                 except Exception:
-                    pass
-        return findings
+                    LOG.debug("audit: hook on_audit_missing failed", exc_info=True)
+            return False
 
-    def _check_critical_packages(self, mapping: Dict[str, Dict[str,Any]]) -> List[AuditFinding]:
-        findings: List[AuditFinding] = []
-        for path, rec in mapping.items():
-            pkg = rec.get("package")
-            if pkg in self.crit_pkgs:
-                fds = self._check_file(path, rec)
-                findings.extend(fds)
-        return findings
+        # file exists
+        stat = os.stat(path)
+        size = stat.st_size
+        mtime = int(stat.st_mtime)
+        rec = self._db_fetchone(f"SELECT sha256, size, mtime, last_checked FROM {_AUDIT_TABLE} WHERE path = ? LIMIT 1", (path,))
+        now_ts = _now_ts()
 
-    # Auto-fix: try reinstall via pkgtool/buildsystem
-    def attempt_auto_fix(self, report: AuditReport) -> List[Dict[str,Any]]:
-        results: List[Dict[str,Any]] = []
-        if not self.pkgtool:
-            logger.warning("pkgtool not available; cannot auto-fix")
+        # if there is a record and not forced, maybe skip rehash
+        if rec and not force:
+            recorded_size = rec.get("size")
+            recorded_mtime = rec.get("mtime")
+            last_checked = rec.get("last_checked") or 0
+            # if size and mtime unchanged and last_checked within threshold, skip rehash
+            if recorded_size == size and recorded_mtime == mtime:
+                age = now_ts - int(last_checked)
+                if age <= int(self.skip_if_unchanged_seconds):
+                    # update last_checked timestamp only
+                    self._db_execute(f"UPDATE {_AUDIT_TABLE} SET last_checked = ? WHERE path = ?", (now_ts, path))
+                    LOG.debug("audit: skip rehash for %s (unchanged, last_checked %s seconds ago)", path, age)
+                    emit_event("audit.file.checked", {"path": path, "skipped": True})
+                    return True
+
+        # compute sha256 (may be expensive)
+        try:
+            if dry_run:
+                LOG.info("[dry-run] audit would compute sha256 for %s", path)
+                # optimistic: consider ok in dry-run mode
+                return True
+            sha = _sha256_file(path, block_size=self.hash_block_size)
+        except Exception:
+            LOG.exception("audit: sha256 calculation failed for %s", path)
+            self._record_event(path, sha256=None, size=size, mtime=mtime, event_type="error", notes="sha-failed")
+            emit_event("audit.file.error", {"path": path, "reason": "sha_failed"})
+            return False
+
+        # if no prior record -> new
+        if not rec:
+            # insert record
+            ok = self._db_execute(
+                f"INSERT OR REPLACE INTO {_AUDIT_TABLE} (path, sha256, size, mtime, created_at, last_checked, event_type, notes) VALUES (?,?,?,?,?,?,?,?)",
+                (path, sha, size, mtime, now_ts, now_ts, "new", "initial_record")
+            )
+            if ok:
+                LOG.info("audit: new file recorded %s", path)
+                emit_event("audit.file.new", {"path": path, "sha256": sha})
+                if self.hooks:
+                    try:
+                        self.hooks.run("on_audit_new", {"path": path, "sha256": sha})
+                    except Exception:
+                        LOG.debug("audit: hook on_audit_new failed", exc_info=True)
+            return True
+
+        # compare with recorded hash
+        old_sha = rec.get("sha256")
+        if old_sha != sha:
+            LOG.warning("audit: file modified: %s (old=%s new=%s)", path, old_sha, sha)
+            # update record indicating modification
+            self._db_execute(
+                f"UPDATE {_AUDIT_TABLE} SET sha256=?, size=?, mtime=?, last_checked=?, event_type=?, notes=? WHERE path=?",
+                (sha, size, mtime, now_ts, "modified", f"modified_at_{_iso_now()}", path)
+            )
+            emit_event("audit.file.modified", {"path": path, "old_sha": old_sha, "new_sha": sha})
+            # call hooks
+            if self.hooks:
+                try:
+                    self.hooks.run("on_audit_fail", {"path": path, "old_sha": old_sha, "new_sha": sha})
+                except Exception:
+                    LOG.debug("audit: hook on_audit_fail failed", exc_info=True)
+            return False
+
+        # sha matches -> update last_checked
+        self._db_execute(
+            f"UPDATE {_AUDIT_TABLE} SET last_checked=?, event_type=?, notes=? WHERE path=?",
+            (now_ts, "checked", "ok", path)
+        )
+        LOG.debug("audit: file ok %s", path)
+        emit_event("audit.file.ok", {"path": path})
+        return True
+
+    def audit_paths(self, paths: Iterable[str], parallel: Optional[bool] = True, dry_run: Optional[bool] = None) -> Dict[str, bool]:
+        """
+        Audit multiple paths. Returns mapping path -> bool (True=ok, False=failed/missing).
+        parallel: whether to perform checks in parallel using ThreadPoolExecutor.
+        """
+        dry_run = bool(_cfg_get("dry_run_default", False)) if dry_run is None else bool(dry_run)
+        results: Dict[str, bool] = {}
+        paths_list = [str(p) for p in paths]
+
+        if not paths_list:
             return results
-        # group findings by package
-        by_pkg: Dict[str, List[AuditFinding]] = {}
-        for f in report.findings:
-            if f.package:
-                by_pkg.setdefault(f.package, []).append(f)
-        for pkg, findings in by_pkg.items():
-            # only handle missing/modified
-            if not any(f.kind in ("missing", "modified") for f in findings):
-                continue
-            # optionally create snapshot via deepclean or quickpkg
-            snapshot_info = None
+
+        # call pre_audit hook
+        if self.hooks:
             try:
-                if self.deepclean:
-                    # ask deepclean for a snapshot method if available
-                    if hasattr(self.deepclean, "create_snapshot_for_package"):
-                        snapshot_info = self.deepclean.create_snapshot_for_package(pkg)
+                self.hooks.run("pre_audit", {"paths": paths_list, "dry_run": dry_run})
             except Exception:
-                logger.exception("snapshot creation failed for %s", pkg)
+                LOG.debug("audit: pre_audit hook failed", exc_info=True)
 
-            # try reuse binary or rebuild via buildsystem/pkgtool
-            installed_version = None
-            if self.db:
+        if parallel:
+            workers = max(1, int(self.parallel_workers))
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                futures = {ex.submit(self.verify_file_integrity, p, False, dry_run): p for p in paths_list}
+                for fut in as_completed(futures):
+                    p = futures[fut]
+                    try:
+                        ok = fut.result()
+                    except Exception:
+                        LOG.exception("audit: exception auditing %s", p)
+                        ok = False
+                    results[p] = ok
+        else:
+            for p in paths_list:
                 try:
-                    row = self.db.fetchone("SELECT version FROM installed_packages WHERE name = ? LIMIT 1", (pkg,))
-                    if row:
-                        installed_version = row.get("version")
+                    results[p] = self.verify_file_integrity(p, False, dry_run)
                 except Exception:
-                    pass
+                    LOG.exception("audit: exception auditing %s", p)
+                    results[p] = False
 
-            package_path = None
-            # try pkgtool.reuse_or_create if available
+        # post_audit hook
+        if self.hooks:
             try:
-                pt = self.pkgtool
-                if hasattr(pt, "reuse_or_create"):
-                    res = pt.reuse_or_create(pkg, installed_version or "", destdir=str(Path(tempfile.mkdtemp()) / pkg))
-                    if res and res.get("package_path"):
-                        package_path = res.get("package_path")
-                # if no binary, attempt build via buildsystem
-                if not package_path and self.buildsystem and hasattr(self.buildsystem, "build_package"):
-                    # try to find meta in repo or installed records
-                    meta_path = None
-                    if self.meta_loader:
-                        # try to find local meta by name (search simple locations)
-                        # this is a lightweight heuristic: search cwd and ~/.rquest
-                        for p in [Path.cwd(), Path.home() / ".rquest" / "repo"]:
-                            for f in p.rglob("*.meta"):
-                                try:
-                                    m = self.meta_loader.load(str(f))
-                                    if m.name == pkg:
-                                        meta_path = str(f)
-                                        break
-                                except Exception:
-                                    continue
-                            if meta_path:
-                                break
-                    if meta_path:
-                        mp = self.meta_loader.load(meta_path)
-                        res = self.buildsystem.build_package(mp.to_dict(), force=True, dry_run=False)
-                        if res.get("ok") and res.get("detail", {}).get("artifact"):
-                            package_path = res["detail"]["artifact"]
+                self.hooks.run("post_audit", {"results": results})
             except Exception:
-                logger.exception("Auto-fix build/reuse failed for %s", pkg)
+                LOG.debug("audit: post_audit hook failed", exc_info=True)
 
-            # Attempt installation (sandboxed if possible)
-            if package_path:
-                try:
-                    if self.sandboxmgr and hasattr(self.sandboxmgr, "start_session"):
-                        sess = self.sandboxmgr.start_session()
-                        try:
-                            # prefer pkgtool.install_bin with sandbox option
-                            if hasattr(self.pkgtool, "install_bin"):
-                                inst = self.pkgtool.install_bin(package_path, target=None, sandbox_run=True, use_fakeroot=True)
-                                results.append({"package": pkg, "installed": inst})
-                            else:
-                                # fallback: attempt direct install (dangerous)
-                                inst = {"ok": False, "error": "no install API"}
-                            # stop session
-                        finally:
-                            try:
-                                self.sandboxmgr.stop_session(sess)
-                            except Exception:
-                                pass
-                    else:
-                        if not self.auto_fix_cfg.get("allowed", False):
-                            logger.warning("Auto-fix not allowed without sandbox for %s", pkg)
-                            continue
-                        if hasattr(self.pkgtool, "install_bin"):
-                            inst = self.pkgtool.install_bin(package_path, target=None, sandbox_run=False, use_fakeroot=True)
-                            results.append({"package": pkg, "installed": inst})
-                except Exception:
-                    logger.exception("Auto-fix install failed for %s", pkg)
-
-                # post-check: re-audit package
-                try:
-                    ar = self.audit_package(meta_path) if meta_path else None
-                    results.append({"package": pkg, "post_audit_findings": len(ar.findings) if ar else None})
-                except Exception:
-                    logger.exception("Post-audit failed for %s", pkg)
-            else:
-                logger.warning("No package artifact available to fix %s", pkg)
-
-            # call hook
-            try:
-                if self.hookmgr:
-                    self.hookmgr.run("on_auto_fix", {"package": pkg, "snapshot": snapshot_info, "results": results})
-            except Exception:
-                logger.debug("on_auto_fix hook failed")
-
-        emit_event("audit.auto_fix_completed", {"count": len(results)})
         return results
 
-# -------------------------
-# Reporting utilities
-# -------------------------
-def export_audit_report(report: AuditReport, fmt: str = "json", path: Optional[str] = None) -> str:
-    fmt = (fmt or "json").lower()
-    stamp = time.strftime("%Y%m%d-%H%M%S")
-    out_dir = REPORT_DIR
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    base = Path(out_dir) / f"audit-{report.run_id}-{stamp}"
-    if not path:
-        path = str(base) + (".json" if fmt == "json" else (".yaml" if fmt == "yaml" else (".html" if fmt == "html" else ".json")))
-    try:
-        data = report.to_dict()
-        if fmt == "json":
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-            return path
-        if fmt == "yaml" and YAML_AVAILABLE:
-            with open(path, "w", encoding="utf-8") as f:
-                yaml.safe_dump(data, f)
-            return path
-        # HTML
-        if fmt in ("html", "pdf"):
-            rows = []
-            for f in report.findings:
-                rows.append(f"<tr><td>{_html.escape(f.id)}</td><td>{_html.escape(f.kind)}</td><td>{_html.escape(f.path)}</td><td>{_html.escape(str(f.package or ''))}</td><td>{_html.escape(json.dumps(f.details))}</td><td>{_html.escape(f.severity)}</td></tr>")
-            html_doc = f"""<html><head><meta charset="utf-8"><title>Rquest Audit {report.run_id}</title></head><body>
-<h1>Rquest Audit</h1>
-<p>Run: {report.run_id} started: {time.ctime(report.started_at)} finished: {time.ctime(report.finished_at or _now_ts())}</p>
-<table border="1" cellpadding="4" cellspacing="0"><thead><tr><th>ID</th><th>Kind</th><th>Path</th><th>Package</th><th>Details</th><th>Severity</th></tr></thead><tbody>
-{''.join(rows)}
-</tbody></table></body></html>"""
-            html_path = str(Path(path) if path.endswith(".html") else Path(str(path)+".html"))
-            with open(html_path, "w", encoding="utf-8") as f:
-                f.write(html_doc)
-            if fmt == "pdf":
-                if _WKHTMLTOPDF:
-                    pdf_path = str(Path(path) if path.endswith(".pdf") else Path(str(path)+".pdf"))
-                    try:
-                        subprocess.check_call(["wkhtmltopdf", html_path, pdf_path])
-                        return pdf_path
-                    except Exception:
-                        logger.exception("wkhtmltopdf failed; returning html")
-                        return html_path
-                else:
-                    logger.warning("wkhtmltopdf not available; returning html")
-                    return html_path
-            return html_path
-        # fallback JSON
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        return path
-    except Exception:
-        logger.exception("export audit report failed")
-        raise
+    def audit_dir(self, directory: str, recursive: bool = True, include_patterns: Optional[List[str]] = None,
+                  exclude_patterns: Optional[List[str]] = None, parallel: Optional[bool] = True,
+                  dry_run: Optional[bool] = None) -> Dict[str, bool]:
+        """
+        Audit all files under directory. Returns mapping path -> bool.
+        - include_patterns, exclude_patterns are simple substrings to match path.
+        """
+        dry_run = bool(_cfg_get("dry_run_default", False)) if dry_run is None else bool(dry_run)
+        root = Path(directory)
+        if not root.exists():
+            LOG.error("audit_dir: directory not found: %s", directory)
+            return {}
 
-# -------------------------
-# Daemon
-# -------------------------
-class AuditDaemon:
-    def __init__(self, auditor: Optional[Auditor] = None, interval: int = 3600, realtime: bool = False, monitor_paths: Optional[List[str]] = None):
-        self.auditor = auditor or Auditor()
-        self.interval = interval
-        self.realtime = realtime
-        self.monitor_paths = monitor_paths or AUDIT_PATHS
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._inotify_thread: Optional[threading.Thread] = None
+        def should_include(p: Path) -> bool:
+            s = str(p)
+            if include_patterns:
+                if not any(pat in s for pat in include_patterns):
+                    return False
+            if exclude_patterns:
+                if any(pat in s for pat in exclude_patterns):
+                    return False
+            return True
 
-    def _loop(self):
-        logger.info("Audit daemon started interval=%s realtime=%s", self.interval, self.realtime)
-        while not self._stop.wait(self.interval):
-            try:
-                report = self.auditor.run_audit(paths=self.monitor_paths, deep=False, auto_fix=False)
-                try:
-                    export_audit_report(report, fmt="json")
-                except Exception:
-                    pass
-                criticals = [f for f in report.findings if f.severity in ("critical", "high")]
-                if criticals:
-                    logger.warning("Audit daemon found %d critical/high findings", len(criticals))
-                    emit_event("audit.critical", {"count": len(criticals), "run_id": report.run_id})
-            except Exception:
-                logger.exception("Audit daemon loop error")
-        logger.info("Audit daemon stopped")
+        files = []
+        if recursive:
+            for dirpath, _, filenames in os.walk(root):
+                for fn in filenames:
+                    fp = os.path.join(dirpath, fn)
+                    if should_include(Path(fp)):
+                        files.append(fp)
+        else:
+            for entry in root.iterdir():
+                if entry.is_file() and should_include(entry):
+                    files.append(str(entry))
 
-    def _inotify_monitor(self):
-        if not _INOTIFY_AVAILABLE:
-            logger.info("inotify not available; realtime disabled")
-            return
+        return self.audit_paths(files, parallel=parallel, dry_run=dry_run)
+
+    def cleanup_missing(self) -> Dict[str, Any]:
+        """
+        Remove DB records for files that no longer exist on disk.
+        Returns summary dict with counts.
+        """
+        if not self.db:
+            LOG.info("audit.cleanup_missing: no DB available")
+            return {"deleted": 0, "checked": 0}
         try:
-            adapter = inotify.adapters.Inotify()
-            for p in self.monitor_paths:
-                if os.path.exists(p):
-                    adapter.add_watch(p)
-            logger.info("Audit inotify watching: %s", self.monitor_paths)
-            for event in adapter.event_gen(yield_nones=False):
-                if self._stop.is_set():
-                    break
-                try:
-                    (_, type_names, path, filename) = event
-                    changed = os.path.join(path, filename) if filename else path
-                    mapping = self.auditor._load_installed_files_map()
-                    rec = mapping.get(os.path.normpath(changed))
-                    findings = self.auditor._check_file(changed, rec)
-                    if findings:
-                        r = AuditReport(_uid("watch-"))
-                        for f in findings:
-                            r.add(f)
-                        r.finish()
-                        export_audit_report(r, fmt="json")
-                        emit_event("audit.file_changed", {"path": changed, "findings": [f.to_dict() for f in findings]})
-                except Exception:
-                    logger.exception("inotify quick-audit error")
+            rows = []
+            try:
+                rows = self.db.fetchall(f"SELECT path FROM {_AUDIT_TABLE}")
+            except Exception:
+                # fallback: try execute and iterate
+                LOG.debug("audit.cleanup_missing: db.fetchall failed, trying fallback", exc_info=True)
+                return {"deleted": 0, "checked": 0}
+            deleted = 0
+            checked = 0
+            for r in rows:
+                path = r.get("path") if isinstance(r, dict) else r[0]
+                checked += 1
+                if not os.path.exists(path):
+                    try:
+                        self._db_execute(f"DELETE FROM {_AUDIT_TABLE} WHERE path = ?", (path,))
+                        deleted += 1
+                        LOG.info("audit.cleanup_missing: removed DB entry for missing %s", path)
+                    except Exception:
+                        LOG.debug("audit.cleanup_missing: failed to remove entry for %s", path, exc_info=True)
+            emit_event("audit.cleanup_missing", {"deleted": deleted, "checked": checked})
+            return {"deleted": deleted, "checked": checked}
         except Exception:
-            logger.exception("inotify monitor failed")
+            LOG.exception("audit.cleanup_missing failed")
+            return {"deleted": 0, "checked": 0}
 
-    def start(self):
-        if self._thread and self._thread.is_alive():
-            return {"ok": False, "reason": "already_running"}
-        self._stop.clear()
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
-        if self.realtime and _INOTIFY_AVAILABLE:
-            self._inotify_thread = threading.Thread(target=self._inotify_monitor, daemon=True)
-            self._inotify_thread.start()
-        return {"ok": True}
+    def purge_old_records(self, older_than_days: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Purge audit records older than configured retention days (based on last_checked).
+        """
+        days = older_than_days if older_than_days is not None else int(self.retention_days)
+        cutoff = _now_ts() - int(days) * 86400
+        if not self.db:
+            LOG.info("audit.purge_old_records: no DB")
+            return {"purged": 0}
+        try:
+            # count first
+            try:
+                rows = self.db.fetchone(f"SELECT COUNT(*) as c FROM {_AUDIT_TABLE} WHERE last_checked < ?", (cutoff,))
+                cnt = rows.get("c") if rows else 0
+            except Exception:
+                cnt = None
+            self._db_execute(f"DELETE FROM {_AUDIT_TABLE} WHERE last_checked < ?", (cutoff,))
+            LOG.info("audit.purge_old_records: purged records older than %d days", days)
+            emit_event("audit.purge", {"purged_estimate": cnt})
+            return {"purged_estimate": cnt}
+        except Exception:
+            LOG.exception("audit.purge_old_records failed")
+            return {"purged": 0}
 
-    def stop(self):
-        if not self._thread:
-            return {"ok": False, "reason": "not_running"}
-        self._stop.set()
-        self._thread.join(timeout=10)
-        if self._inotify_thread:
-            self._inotify_thread.join(timeout=5)
-        return {"ok": True}
+    def export_audit_log(self, out_path: Optional[str] = None, fmt: str = "json") -> str:
+        """
+        Export audit log to file. Returns path of exported file.
+        Supported formats: json (array), jsonl (one object per line), csv (basic).
+        """
+        out_path = out_path or str(Path(REPORT_DIR) / f"audit_export_{int(time.time())}.{fmt}")
+        try:
+            rows = []
+            if self.db:
+                try:
+                    rows = self.db.fetchall(f"SELECT path, sha256, size, mtime, created_at, last_checked, event_type, notes FROM {_AUDIT_TABLE}")
+                except Exception:
+                    LOG.debug("audit.export: db.fetchall failed", exc_info=True)
+                    rows = []
+            if fmt == "json":
+                data = []
+                for r in rows:
+                    data.append(dict(r))
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(out_path).write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+            elif fmt == "jsonl":
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as fh:
+                    for r in rows:
+                        fh.write(json.dumps(dict(r), ensure_ascii=False) + "\n")
+            elif fmt == "csv":
+                import csv
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                with open(out_path, "w", newline="", encoding="utf-8") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["path", "sha256", "size", "mtime", "created_at", "last_checked", "event_type", "notes"])
+                    for r in rows:
+                        row = dict(r)
+                        writer.writerow([row.get(k) for k in ["path", "sha256", "size", "mtime", "created_at", "last_checked", "event_type", "notes"]])
+            else:
+                raise ValueError("unsupported format")
+            LOG.info("audit.export_audit_log: exported to %s", out_path)
+            return out_path
+        except Exception:
+            LOG.exception("audit.export_audit_log failed")
+            raise
 
-# module-level helpers
-_DAEMON: Optional[AuditDaemon] = None
-_AUDITOR: Optional[Auditor] = None
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Return basic stats about audit DB and config.
+        """
+        stats: Dict[str, Any] = {"enabled": self.enabled, "parallel_workers": self.parallel_workers}
+        if not self.db:
+            stats["db"] = "unavailable"
+            return stats
+        try:
+            try:
+                row = self.db.fetchone(f"SELECT COUNT(*) as total, SUM(CASE WHEN event_type='modified' THEN 1 ELSE 0 END) as modified FROM {_AUDIT_TABLE}")
+                if row:
+                    stats["total_records"] = int(row.get("total", 0))
+                    stats["modified"] = int(row.get("modified", 0))
+            except Exception:
+                stats["total_records"] = None
+                stats["modified"] = None
+        except Exception:
+            LOG.debug("audit.get_stats failed", exc_info=True)
+        return stats
 
-def get_auditor() -> Auditor:
-    global _AUDITOR
-    if _AUDITOR is None:
-        _AUDITOR = Auditor()
-    return _AUDITOR
+    # Internal recording helper
+    def _record_event(self, path: str, sha256: Optional[str], size: Optional[int],
+                      mtime: Optional[int], event_type: str, notes: Optional[str] = None):
+        """Insert or update audit record in DB (best-effort)."""
+        if not self.db:
+            return False
+        now = _now_ts()
+        try:
+            # Upsert pattern
+            self._db_execute(
+                f"INSERT OR REPLACE INTO {_AUDIT_TABLE} (path, sha256, size, mtime, created_at, last_checked, event_type, notes) VALUES (?,?,?,?,?,?,?,?)",
+                (path, sha256, size, mtime, now, now, event_type, notes or "")
+            )
+            return True
+        except Exception:
+            LOG.exception("audit._record_event failed for %s", path)
+            return False
 
-def get_daemon() -> AuditDaemon:
-    global _DAEMON
-    if _DAEMON is None:
-        cfg = DAEMON_CFG or {}
-        _DAEMON = AuditDaemon(auditor=get_auditor(), interval=int(cfg.get("interval_seconds", 3600)), realtime=bool(cfg.get("realtime", False)), monitor_paths=cfg.get("monitor_paths", AUDIT_PATHS))
-    return _DAEMON
-
-# -------------------------
-# CLI
-# -------------------------
+# CLI helper for testing
 def _cli(argv=None):
     import argparse
-    ap = argparse.ArgumentParser(prog="rquest-audit", description="Rquest audit")
-    ap.add_argument("--run", action="store_true", help="run audit now")
-    ap.add_argument("--deep", action="store_true", help="deep walk configured paths")
-    ap.add_argument("--package", metavar="META", help="audit a single package using .meta path")
-    ap.add_argument("--auto-fix", action="store_true", help="attempt auto-fix when possible")
-    ap.add_argument("--export", metavar="FMT", default="json", help="export format: json|yaml|html|pdf")
-    ap.add_argument("--start-daemon", action="store_true", help="start audit daemon")
-    ap.add_argument("--stop-daemon", action="store_true", help="stop audit daemon")
-    ap.add_argument("--profile", metavar="NAME", help="compliance profile")
+    ap = argparse.ArgumentParser(prog="rquest-audit", description="Audit module CLI")
+    ap.add_argument("--audit", nargs="*", help="files to audit")
+    ap.add_argument("--audit-dir", help="directory to audit recursively")
+    ap.add_argument("--export", help="export audit log (optional path)")
+    ap.add_argument("--format", default="json", help="export format: json/jsonl/csv")
+    ap.add_argument("--cleanup-missing", action="store_true")
+    ap.add_argument("--purge-old", action="store_true")
+    ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
-    if args.start_daemon:
-        print(get_daemon().start())
-        return
-    if args.stop_daemon:
-        print(get_daemon().stop())
-        return
-    auditor = get_auditor()
-    if args.run or args.package:
-        if args.package:
-            r = auditor.audit_package(args.package)
-        else:
-            r = auditor.run_audit(paths=AUDIT_PATHS, deep=args.deep, auto_fix=args.auto_fix, compliance_profile=args.profile)
-        out = export_audit_report(r, fmt=args.export)
-        print("Report saved to", out)
-        return
+
+    aud = Auditor(db_factory=get_db if get_db else None)
+    if args.audit:
+        res = aud.audit_paths(args.audit, parallel=True, dry_run=args.dry_run)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if args.audit_dir:
+        res = aud.audit_dir(args.audit_dir, parallel=True, dry_run=args.dry_run)
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+    if args.cleanup_missing:
+        print(aud.cleanup_missing())
+        return 0
+    if args.purge_old:
+        print(aud.purge_old_records())
+        return 0
+    if args.export:
+        path = aud.export_audit_log(args.export, fmt=args.format)
+        print("exported to", path)
+        return 0
     ap.print_help()
+    return 1
 
 if __name__ == "__main__":
-    _cli(sys.argv[1:])
+    sys.exit(_cli(sys.argv[1:]))
