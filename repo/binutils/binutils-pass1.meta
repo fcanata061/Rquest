@@ -1,0 +1,72 @@
+package:
+  name: binutils-pass1
+  version: 2.41
+  release: 1
+  category: toolchain
+  summary: "Binutils (passo 1) — conjunto de ferramentas para linking/assembly (bootstrap)"
+  description: |
+    Este é o primeiro estágio de compilação do GNU Binutils, usado no processo
+    de construção de toolchain cross-compilation (LFS bootstrap). Ele instala
+    apenas as ferramentas mínimas necessárias para compilar o GCC pass1.
+
+upstream:
+  url: https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz
+  protocol: https
+  checksum: "sha256:fc7b99ecbf5eebf2f61fae50a6f9712b3a793bcee664f645dd5bb7b2d8e9f822"
+
+dependencies:
+  build:
+    - gcc
+    - make
+    - bash
+    - coreutils
+    - gawk
+    - texinfo
+  runtime: []
+
+environment:
+  variables:
+    LFS: "/mnt/lfs"
+    LFS_TGT: "x86_64-lfs-linux-gnu"
+    PATH: "$LFS/tools/bin:/usr/bin:/bin"
+
+prepare:
+  steps:
+    - "tar -xf binutils-2.41.tar.xz"
+    - "cd binutils-2.41"
+    - "mkdir -v build && cd build"
+
+build:
+  steps:
+    - "../configure --prefix=$LFS/tools \
+        --with-sysroot=$LFS \
+        --target=$LFS_TGT \
+        --disable-nls \
+        --disable-werror"
+    - "make -j$(nproc)"
+
+install:
+  steps:
+    - "make install DESTDIR=$LFS"
+
+hooks:
+  pre-configure: []
+  post-configure: []
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install:
+    - "echo 'Binutils pass1 instalado em $LFS/tools'"
+
+files:
+  - "$LFS/tools/bin/*"
+  - "$LFS/tools/$LFS_TGT/bin/*"
+
+metadata:
+  maintainer: "Equipe Rquest"
+  license: "GPL-3.0-or-later"
+  homepage: "https://www.gnu.org/software/binutils/"
+  tags:
+    - toolchain
+    - bootstrap
+    - cross-compiler
