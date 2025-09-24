@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+# rquest wrapper binário
+
+import os
+import sys
+from pathlib import Path
+
+# Caminho base do Rquest instalado no sistema
+BASE_DIR = Path("/usr/lib/rquest1.0")
+
+# Garante que os módulos possam ser importados
+MODULES_DIR = BASE_DIR / "modules"
+sys.path.insert(0, str(BASE_DIR))
+sys.path.insert(0, str(MODULES_DIR))
+
+# Exporta PYTHONPATH se alguém chamar subprocessos dentro do Rquest
+os.environ["PYTHONPATH"] = f"{BASE_DIR}:{MODULES_DIR}:" + os.environ.get("PYTHONPATH", "")
+
+# Sanity check rápido
+if not (BASE_DIR / "cli.py").exists():
+    sys.stderr.write("[Rquest] Erro: cli.py não encontrado em /usr/lib/rquest1.0\n")
+    sys.exit(1)
+
+# Importa o CLI principal
+from cli import main
+
+if __name__ == "__main__":
+    sys.exit(main())
