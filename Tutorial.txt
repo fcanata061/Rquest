@@ -1,0 +1,166 @@
+==========================================
+RQUEST - GERENCIADOR DE PACOTES UNIVERSAL
+==========================================
+
+Versão: 1.0
+Local de instalação padrão: /usr/lib/rquest1.0/
+Binário: /usr/bin/rquest
+Configuração: /etc/rquest/config.yaml
+Repositórios locais: /var/lib/rquest/repos/
+Cache de pacotes: /var/cache/rquest/
+Logs: /var/log/rquest/
+
+------------------------------------------
+1. DEPENDÊNCIAS NECESSÁRIAS
+------------------------------------------
+Pacotes do sistema:
+  git, wget, curl, rsync, tar, gzip, bzip2, xz, zstd,
+  make, cmake, ninja, gcc, g++, clang, lld,
+  patch, file, fakeroot, bubblewrap (sandbox),
+  python3, pip, notify-send, i3blocks ou lemonbar (opcional)
+
+Bibliotecas Python:
+  pyyaml, requests, tqdm, rich, colorama,
+  packaging, psutil, scikit-learn (ML)
+
+Sistemas de arquivos opcionais:
+  btrfs-progs, zfsutils-linux (para snapshots)
+
+------------------------------------------
+2. ÁRVORE DE DIRETÓRIOS
+------------------------------------------
+/usr/bin/rquest              → wrapper CLI
+/usr/lib/rquest1.0/modules/  → módulos principais
+/etc/rquest/config.yaml      → configuração global
+/var/lib/rquest/repos/       → repositórios locais
+/var/cache/rquest/           → cache de pacotes binários
+/var/log/rquest/             → logs de operações
+/tmp/rquest-build/           → área temporária de builds
+
+------------------------------------------
+3. FLUXO DE FUNCIONAMENTO
+------------------------------------------
+- Repositórios git trazem .meta (receitas de build).
+- O Rquest sincroniza e valida.
+- O usuário instala/remova/atualiza pacotes.
+- O sandbox + fakeroot garantem segurança.
+- Auditoria e snapshots previnem corrupção.
+- Notificações e contador de updates informam status.
+
+------------------------------------------
+4. COMANDOS SUPORTADOS
+------------------------------------------
+
+[Pacotes básicos]
+  rquest install <pkg>       → instala pacote
+  rquest remove <pkg>        → remove pacote
+  rquest upgrade             → atualiza pacotes
+  rquest upgrade <pkg>       → atualiza pacote específico
+  rquest rebuild-system      → recompila todo o sistema
+  rquest search <pkg>        → busca pacotes
+  rquest info <pkg>          → mostra metadados do pacote
+
+[Consultas - query_tools]
+  rquest qlist               → lista pacotes instalados
+  rquest qdepends <pkg>      → mostra dependências
+  rquest qfiles <pkg>        → lista arquivos de um pacote
+  rquest qprovides <file>    → mostra pacote que fornece arquivo
+
+[Repositórios - repo_sync]
+  rquest repo-sync           → sincroniza repositórios
+  rquest repo-add <url>      → adiciona repositório remoto
+  rquest repo-list           → lista repositórios
+  rquest repo-update <repo>  → atualiza um repositório
+
+[Empacotamento - pkgtool]
+  rquest quickpkg <pkg>      → cria pacote binário
+  rquest pkg-cache           → gerencia cache binário
+  rquest pkg-reuse <pkg>     → reinstala binário do cache
+
+[Toolchain - toolchain]
+  rquest toolchain build gcc → constrói GCC
+  rquest toolchain build llvm→ constrói LLVM
+  rquest toolchain bootstrap → inicia stage1
+  rquest toolchain switch <c>→ muda compilador padrão
+  rquest toolchain list      → mostra toolchains disponíveis
+
+[Auditoria & manutenção]
+  rquest audit               → verifica integridade
+  rquest deepclean           → remove órfãos e temporários
+  rquest conflicts           → detecta conflitos de arquivos
+  rquest notifier            → checa upstream e notifica
+
+[Sandbox & fakeroot]
+  rquest sandbox run <cmd>   → executa comando isolado
+  rquest fakeroot install <pkg> → instala em ambiente fake
+
+[Snapshots]
+  rquest snapshot create     → cria snapshot
+  rquest snapshot rollback   → restaura snapshot
+
+[Python manager]
+  rquest python-check        → checa versões Python
+  rquest python-fix          → corrige conflitos
+  rquest python-set <ver>    → define versão padrão
+
+[Meta]
+  rquest meta-validate <file.meta> → valida .meta
+  rquest meta-gen <pkg>            → gera .meta inicial
+
+------------------------------------------
+5. MANUTENÇÃO DO SISTEMA
+------------------------------------------
+
+[Auditoria]
+  Use `rquest audit` regularmente para checar:
+    - Integridade de arquivos instalados
+    - Hashes diferentes de origem
+    - Pacotes quebrados ou incompletos
+
+[Limpeza]
+  - `rquest deepclean` → remove dependências órfãs e builds temporários
+  - `rquest pkg-cache` → lista pacotes binários em cache
+  - `rquest pkg-cache clean` → limpa cache antigo
+
+[Toolchain]
+  - Sempre reconstruir após grandes upgrades:
+    `rquest toolchain build gcc`
+  - Para sistemas base, usar:
+    `rquest toolchain bootstrap`
+  - Alternar entre GCC/LLVM:
+    `rquest toolchain switch gcc`
+
+[Snapshots]
+  - Criar snapshot antes de upgrades críticos:
+    `rquest snapshot create`
+  - Reverter em caso de falha:
+    `rquest snapshot rollback`
+
+[Notificações]
+  - O `update_notifier` roda em segundo plano
+  - Integração com `i3blocks` e `lemonbar`
+  - Mostra ícone + contador de pacotes desatualizados
+
+[Python]
+  - Pacotes que dependem de Python podem quebrar
+  - Corrigir automaticamente:
+    `rquest python-fix`
+  - Definir versão padrão:
+    `rquest python-set 3.11`
+
+------------------------------------------
+6. BOAS PRÁTICAS DE USO
+------------------------------------------
+- Sempre rodar `rquest repo-sync` antes de instalar/atualizar.
+- Usar `rquest audit` após upgrades pesados.
+- Criar snapshots antes de mexer na toolchain.
+- Nunca modificar `/usr/lib/rquest1.0/modules/` manualmente.
+- Configuração customizada deve ir em `/etc/rquest/config.yaml`.
+- Logs em `/var/log/rquest/` ajudam a depurar erros.
+
+------------------------------------------
+7. SUPORTE
+------------------------------------------
+- Configuração: /etc/rquest/config.yaml
+- Repositórios locais: /var/lib/rquest/repos/
+- Documentação oficial: (em desenvolvimento)
