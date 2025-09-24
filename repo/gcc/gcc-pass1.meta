@@ -1,0 +1,80 @@
+package:
+  name: gcc-pass1
+  version: 13.2.0
+  release: 1
+  description: "GCC Pass1 (Stage1) – usado no bootstrap inicial da toolchain, com deps internas."
+  license: GPL-3.0
+  homepage: https://gcc.gnu.org/
+  maintainer: "Rquest Team"
+
+source:
+  - url: https://ftp.gnu.org/gnu/gcc/gcc-13.2.0/gcc-13.2.0.tar.xz
+    sha256: e0d0fd99cbbd9d9d9d2c8c71b5dce843f9a2e53c49bcb2a3e73a3a55e5a7b30e
+  - url: https://ftp.gnu.org/gnu/gmp/gmp-6.3.0.tar.xz
+    sha256: 5c4026dbb165f85a70a0ec4c00d0f0b0df28edcd7c4520fa63c19e78146ee6a6
+  - url: https://ftp.gnu.org/gnu/mpfr/mpfr-4.2.1.tar.xz
+    sha256: 06a2c2f8c8e12f5c7b3b7b7a36c6311b5de3c4e9f08f6c5faff1235a92220ef4
+  - url: https://ftp.gnu.org/gnu/mpc/mpc-1.3.1.tar.gz
+    sha256: 17503d2c395c8b1b46aeb5f8f647fb6cf1a2ddc7da9c9cbfa6e86c8c8e8e9a0e
+  - url: https://gcc.gnu.org/pub/gcc/infrastructure/isl-0.26.tar.xz
+    sha256: 2fc4087b4d4c3e4f682e3c95a4b1d4db9e8c5d4c929ada1c14fdf2b9a58e0e8d
+
+dependencies:
+  build: []
+  runtime: []
+
+prepare:
+  steps:
+    - echo ">>> Movendo dependências para dentro do source do GCC..."
+    - mv ../gmp-6.3.0 gmp
+    - mv ../mpfr-4.2.1 mpfr
+    - mv ../mpc-1.3.1 mpc
+    - mv ../isl-0.26 isl
+
+build:
+  system: autotools
+  out_of_source: true
+  configure:
+    - --target=${TARGET}
+    - --prefix=${TOOLS}/gcc-pass1
+    - --with-glibc-version=2.37
+    - --with-sysroot=${TOOLS}
+    - --with-newlib
+    - --without-headers
+    - --enable-initfini-array
+    - --disable-nls
+    - --disable-shared
+    - --disable-multilib
+    - --disable-decimal-float
+    - --disable-threads
+    - --disable-libatomic
+    - --disable-libgomp
+    - --disable-libquadmath
+    - --disable-libssp
+    - --disable-libvtv
+    - --disable-libstdcxx
+    - --enable-languages=c
+  make: ["all-gcc", "all-target-libgcc"]
+  install: ["install-gcc", "install-target-libgcc"]
+
+install:
+  fakeroot: true
+  paths:
+    - ${TOOLS}/gcc-pass1/bin
+    - ${TOOLS}/gcc-pass1/libexec
+    - ${TOOLS}/gcc-pass1/lib
+    - ${TOOLS}/gcc-pass1/include
+
+hooks:
+  pre-configure:
+    - echo ">>> Preparando build dir para GCC-Pass1"
+  post-install:
+    - echo ">>> GCC-Pass1 instalado em ${TOOLS}/gcc-pass1"
+
+sandbox:
+  enabled: true
+  network: false
+  mounts:
+    - /dev
+    - /proc
+    - /sys
