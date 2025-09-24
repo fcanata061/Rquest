@@ -1,18 +1,20 @@
 # rquest1.0/modules/config.py
 # -*- coding: utf-8 -*-
 """
-Central config loader for Rquest
-- Reads YAML/JSON config from multiple locations (env override, cwd, user, system)
-- Merges with defaults, normalizes paths and types, converts human sizes
-- Validates configuration (strict when possible)
-- Provides typed access (dataclasses) and helpers for modules
-- Watcher: uses watchdog if available, fallback to polling
-- Save supports writing only the override (diff) and preserves comments with ruamel if available
-- Thread-safe reload and watcher notification
+Rquest central configuration loader (final version)
+
+Features:
+- Read YAML/JSON config from multiple locations (env override, cwd, user, system)
+- Merge with authoritative DEFAULTS, normalize/coerce types (human sizes to bytes)
+- Validate structure and types, warn or error (fatal optional)
+- Provide typed access via Config dataclass (get_config(), get_module_config(), helpers)
+- Watch file changes: use watchdog if available, fallback to polling
+- Thread-safe load/reload and watcher notification
+- Save supports writing only the overrides (diff) and preserves comments if ruamel.yaml available
+- Integrates by design with modules via helpers: get_db_path(), get_build_config(), get_module_config()
 """
 
 from __future__ import annotations
-
 import os
 import sys
 import json
@@ -21,22 +23,22 @@ import logging
 import threading
 from pathlib import Path
 from copy import deepcopy
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, List, Tuple, Callable, Union
 
-# Optional libs
+# Optional dependencies
 try:
-    import ruamel.yaml as ruamel_yaml  # preserves comments on save
+    import ruamel.yaml as ruamel_yaml  # preserves comments when saving
     _HAS_RUAMEL = True
 except Exception:
     ruamel_yaml = None
     _HAS_RUAMEL = False
 
 try:
-    import yaml  # PyYAML fallback
+    import yaml as pyyaml  # PyYAML for parsing
     _HAS_PYYAML = True
 except Exception:
-    yaml = None
+    pyyaml = None
     _HAS_PYYAML = False
 
 try:
@@ -60,13 +62,14 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 # ----------------------------
-# Defaults (authoritative)
+# DEFAULT configuration (authoritative base)
 # ----------------------------
 DEFAULTS: Dict[str, Any] = {
     "logging": {
         "level": "INFO",
         "file": None,
         "color": True,
+        "max_size": "10M",  # human readable
     },
     "db": {
         "path": "~/.rquest/db.sqlite3",
@@ -103,8 +106,9 @@ DEFAULTS: Dict[str, Any] = {
         "cache_dir": "~/.rquest/fetch-cache",
         "mirrors": [],
         "http_timeout": 30,
+        "retries": 3
     },
-    "modules": {},  # per-module overrides
+    "modules": {},  # per-module overrides: modules.<name> -> dict
     "watch": {
         "enabled": True,
         "use_watchdog_if_available": True,
@@ -113,16 +117,16 @@ DEFAULTS: Dict[str, Any] = {
 }
 
 # ----------------------------
-# Typed dataclass fallback (used when pydantic not available)
+# Dataclass to hold config
 # ----------------------------
 @dataclass
 class Config:
-    raw: Dict[str, Any] = field(default_factory=dict)
-    merged: Dict[str, Any] = field(default_factory=dict)
+    raw: Dict[str, Any] = field(default_factory=dict)     # values loaded from file (if any)
+    merged: Dict[str, Any] = field(default_factory=dict)  # merged with DEFAULTS
 
     def get(self, path: str, default: Any = None) -> Any:
-        """dot separated getter"""
-        parts = path.split(".")
+        """Dot-separated getter for merged config."""
+        parts = path.split(".") if path else []
         cur: Any = self.merged
         for p in parts:
             if isinstance(cur, dict) and p in cur:
@@ -135,14 +139,14 @@ class Config:
         return deepcopy(self.merged)
 
 # ----------------------------
-# Globals and state
+# Module state
 # ----------------------------
 _CONFIG: Optional[Config] = None
 _CONFIG_LOCK = threading.RLock()
 _CONFIG_PATH: Optional[Path] = None
 _CONFIG_MTIME: Optional[float] = None
 _WATCH_CALLBACKS: List[Callable[[Config], None]] = []
-_WATCH_THREAD: Optional[threading.Thread] = None
+_WATCHER_THREAD: Optional[threading.Thread] = None
 _OBSERVER: Optional[Observer] = None
 
 # ----------------------------
@@ -154,25 +158,26 @@ def _human_size_to_bytes(val: Union[str, int, None]) -> Optional[int]:
     if isinstance(val, int):
         return val
     s = str(val).strip().upper()
-    units = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4}
+    units = {"K": 1024, "KB": 1024, "M": 1024**2, "MB": 1024**2, "G": 1024**3, "GB": 1024**3, "T": 1024**4}
     try:
-        if s[-1] in units:
-            return int(float(s[:-1]) * units[s[-1]])
-        return int(s)
+        for suffix, mul in units.items():
+            if s.endswith(suffix):
+                num = float(s[: -len(suffix)].strip())
+                return int(num * mul)
+        return int(float(s))
     except Exception:
-        logger.warning("config: failed to parse size '%s'", val)
+        logger.warning("config: cannot parse human size '%s'", val)
         return None
 
-def _expand_path(p: Optional[str]) -> Optional[str]:
-    if p is None:
+def _expand_path(val: Optional[str]) -> Optional[str]:
+    if val is None:
         return None
     try:
-        return os.path.abspath(os.path.expanduser(os.path.expandvars(p)))
+        return os.path.abspath(os.path.expanduser(os.path.expandvars(val)))
     except Exception:
-        return p
+        return val
 
 def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
-    """Merge b into a recursively, returning a new dict"""
     res = deepcopy(a)
     for k, v in b.items():
         if k in res and isinstance(res[k], dict) and isinstance(v, dict):
@@ -181,75 +186,75 @@ def _deep_merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
             res[k] = deepcopy(v)
     return res
 
-def _find_config_candidates() -> List[Path]:
-    """Ordered candidate paths to search for config file"""
-    out: List[Path] = []
+def _find_candidates(explicit: Optional[str] = None) -> List[Path]:
+    candidates: List[Path] = []
     env = os.environ.get("RQUEST_CONFIG")
+    if explicit:
+        candidates.append(Path(explicit))
     if env:
-        out.append(Path(env))
-    # project cwd then user then system
-    out.extend([
+        candidates.append(Path(env))
+    candidates.extend([
         Path.cwd() / "config.yaml",
+        Path.cwd() / "config.yml",
         Path.cwd() / "config.json",
         Path.home() / ".config" / "rquest" / "config.yaml",
         Path("/etc") / "rquest" / "config.yaml",
     ])
-    return out
+    return candidates
 
-def _load_yaml_or_json(path: Path) -> Optional[Dict[str, Any]]:
-    """Load a YAML or JSON file, prefer preserving library when available."""
+def _load_file(path: Path) -> Optional[Dict[str, Any]]:
     if not path.exists():
         return None
+    txt = None
     try:
         txt = path.read_text(encoding="utf-8")
     except Exception as e:
-        logger.error("config: cannot read %s: %s", path, e)
+        logger.error("config: failed reading %s: %s", path, e, exc_info=True)
         return None
 
-    # try ruamel (keeps comments) if available and file looks yaml
-    if _HAS_RUAMEL and str(path).lower().endswith((".yaml", ".yml")):
+    # Try ruamel (YAML with comment preservation)
+    if _HAS_RUAMEL and path.suffix.lower() in (".yaml", ".yml"):
         try:
-            yaml_obj = ruamel_yaml.YAML()
-            data = yaml_obj.load(txt)
+            y = ruamel_yaml.YAML()
+            data = y.load(txt)
             return data or {}
         except Exception as e:
-            logger.warning("config: ruamel parse failed %s: %s", path, e)
+            logger.debug("config: ruamel parse fail %s: %s", path, e, exc_info=True)
 
-    # try pyyaml
-    if _HAS_PYYAML:
+    # Try pyyaml
+    if _HAS_PYYAML and path.suffix.lower() in (".yaml", ".yml"):
         try:
-            data = yaml.safe_load(txt)
+            data = pyyaml.safe_load(txt)
             return data or {}
         except Exception as e:
-            logger.debug("config: pyyaml parse failed on %s: %s", path, e)
+            logger.debug("config: pyyaml parse fail %s: %s", path, e, exc_info=True)
 
-    # try json
+    # Try JSON
     try:
         data = json.loads(txt)
         return data
     except Exception as e:
-        logger.debug("config: json parse failed on %s: %s", path, e)
+        logger.debug("config: json parse fail %s: %s", path, e, exc_info=True)
 
-    # last resort: try a minimal key: value parse (very permissive)
+    # Last resort permissive parse (key: value lines) - best-effort
     try:
-        d = {}
+        out: Dict[str, Any] = {}
         for line in txt.splitlines():
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
             if ":" in line:
                 k, v = line.split(":", 1)
-                d[k.strip()] = v.strip()
-        return d
+                out[k.strip()] = v.strip()
+        return out
     except Exception:
         logger.exception("config: fallback parse failed for %s", path)
         return None
 
 def _normalize_and_coerce(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Normalize paths, convert human sizes, coerce booleans/ints where reasonable."""
+    """Normalize path fields, convert human sizes and coerce basic types."""
     out = deepcopy(cfg)
-
-    # normalize known path fields
+    # Normalize path-like entries known in DEFAULTS + common ones
     path_keys = [
         ("db", "path"),
         ("build", "cache_dir"),
@@ -258,27 +263,32 @@ def _normalize_and_coerce(cfg: Dict[str, Any]) -> Dict[str, Any]:
         ("meta", "meta_cache_dir"),
         ("pkgtool", "cache_dir"),
         ("fetcher", "cache_dir"),
+        ("logging", "file"),
     ]
     for keys in path_keys:
         ref = out
         for k in keys[:-1]:
-            ref = ref.get(k, {})
+            if isinstance(ref, dict):
+                ref = ref.get(k, {})
+            else:
+                ref = {}
         last = keys[-1]
         if isinstance(ref, dict) and last in ref and ref[last]:
-            # support nested snapshot.path
             if isinstance(ref[last], dict):
-                # e.g. snapshot: {enabled: True, path: "~/.rquest"}
+                # handle nested snapshot: {enabled, path}
                 if "path" in ref[last] and isinstance(ref[last]["path"], str):
                     ref[last]["path"] = _expand_path(ref[last]["path"])
             elif isinstance(ref[last], str):
                 ref[last] = _expand_path(ref[last])
 
-    # convert some human sizes (logging.max_size etc) if present
+    # Convert human sizes
     if "logging" in out and isinstance(out["logging"], dict):
         if "max_size" in out["logging"]:
-            out["logging"]["max_size_bytes"] = _human_size_to_bytes(out["logging"]["max_size"])
+            ms = _human_size_to_bytes(out["logging"]["max_size"])
+            if ms is not None:
+                out["logging"]["max_size_bytes"] = ms
 
-    # coerce numeric fields (jobs, parallelism, timeouts)
+    # Coerce numbers
     try:
         if "build" in out and isinstance(out["build"], dict):
             if "jobs" in out["build"]:
@@ -286,58 +296,46 @@ def _normalize_and_coerce(cfg: Dict[str, Any]) -> Dict[str, Any]:
             if "timeout" in out["build"]:
                 out["build"]["timeout"] = int(out["build"].get("timeout", 0))
     except Exception:
-        logger.debug("config: failed to coerce build numeric fields", exc_info=True)
+        logger.debug("config: failed to coerce build fields", exc_info=True)
 
     try:
         if "upgrade" in out and isinstance(out["upgrade"], dict):
             out["upgrade"]["parallelism"] = int(out["upgrade"].get("parallelism", 1))
-            snap = out["upgrade"].get("snapshot")
-            if isinstance(snap, dict) and "path" in snap and isinstance(snap["path"], str):
-                snap["path"] = _expand_path(snap["path"])
     except Exception:
         logger.debug("config: failed to coerce upgrade fields", exc_info=True)
 
     return out
 
-def _allowed_top_keys() -> List[str]:
-    """List of allowed top-level keys for lenient validation."""
+def _allowed_top_level_keys() -> List[str]:
     return list(DEFAULTS.keys()) + ["watch"]
 
 def _validate_structure(cfg: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Return (ok, list_of_warnings_or_errors). Does not mutate cfg."""
+    """Return (ok, issues_list). Non-fatal warnings unless called with fatal=True in load."""
     warnings: List[str] = []
     # unknown top-level keys
     for k in cfg.keys():
-        if k not in _allowed_top_keys():
+        if k not in _allowed_top_level_keys():
             warnings.append(f"Unknown top-level config key: {k}")
-
-    # types checks for a few important fields
+    # basic type checks
     if "build" in cfg:
         bj = cfg["build"].get("jobs")
         if not isinstance(bj, int) or bj < 1:
             warnings.append("build.jobs must be integer >= 1")
-
     if "db" in cfg:
         p = cfg["db"].get("path")
         if p and not isinstance(p, str):
-            warnings.append("db.path must be a string path")
-
+            warnings.append("db.path must be a string")
     if "repos" in cfg:
-        remotes = cfg["repos"].get("remotes")
-        if remotes is not None and not isinstance(remotes, list):
+        rem = cfg["repos"].get("remotes")
+        if rem is not None and not isinstance(rem, list):
             warnings.append("repos.remotes should be a list")
-
     return (len(warnings) == 0, warnings)
 
 # ----------------------------
-# Load/Reload API
+# Loading / reloading
 # ----------------------------
-def _find_config_path(explicit: Optional[str] = None) -> Optional[Path]:
-    """Return first existing config path from candidates or explicit given."""
-    candidates = []
-    if explicit:
-        candidates.append(Path(explicit))
-    candidates.extend(_find_config_candidates())
+def _find_path(explicit: Optional[str] = None) -> Optional[Path]:
+    candidates = _find_candidates(explicit)
     for p in candidates:
         if p and p.exists():
             return p
@@ -345,57 +343,49 @@ def _find_config_path(explicit: Optional[str] = None) -> Optional[Path]:
 
 def load(explicit_path: Optional[str] = None, fatal: bool = False) -> Config:
     """
-    Load configuration by merging defaults with file content.
-    If fatal is True, a validation error will raise; otherwise we log warnings and fallback to defaults.
+    Load and merge config. If fatal=True then structural validation failures raise.
+    Returns Config object.
     """
     global _CONFIG, _CONFIG_PATH, _CONFIG_MTIME
     with _CONFIG_LOCK:
-        cfg_file = _find_config_path(explicit_path)
-        raw_cfg: Dict[str, Any] = {}
-        if cfg_file:
-            data = _load_yaml_or_json(cfg_file)
+        cfg_path = _find_path(explicit_path)
+        raw: Dict[str, Any] = {}
+        if cfg_path:
+            data = _load_file(cfg_path)
             if data is None:
-                logger.warning("config: file found but could not be parsed: %s", cfg_file)
-                # keep raw_cfg empty, fallback to defaults
+                logger.warning("config: file found but could not be parsed: %s", str(cfg_path))
             else:
-                raw_cfg = data
-            _CONFIG_PATH = cfg_file
+                raw = data
+            _CONFIG_PATH = cfg_path
             try:
-                _CONFIG_MTIME = float(cfg_file.stat().st_mtime)
+                _CONFIG_MTIME = float(cfg_path.stat().st_mtime)
             except Exception:
                 _CONFIG_MTIME = None
-
-        merged = _deep_merge(DEFAULTS, raw_cfg)
+        merged = _deep_merge(DEFAULTS, raw)
         normalized = _normalize_and_coerce(merged)
-
-        # structure validation
         ok, issues = _validate_structure(normalized)
         if not ok:
-            msg = f"config: structure validation warnings/errors: {issues}"
+            msg = f"config: validation issues: {issues}"
             if fatal:
                 logger.error(msg)
                 raise ValueError(msg)
             else:
                 logger.warning(msg)
-
-        # if pydantic available, try strict validation (forbid extra keys)
+        # Optional stricter validation with pydantic
         if _HAS_PYDANTIC:
             try:
-                # create dynamic model matching DEFAULTS keys
-                class DynamicModel(BaseModel):
+                class DummyModel(BaseModel):
                     class Config:
                         extra = Extra.forbid
-                # quick validation: instantiate to trigger type coercion checks not implemented here
-                DynamicModel(**normalized)  # type: ignore
+                DummyModel(**normalized)  # quick check, might be superficial
             except ValidationError as e:
-                logger.error("config: pydantic validation failed: %s", e)
+                logger.warning("config: pydantic validation issues: %s", e)
                 if fatal:
                     raise
-
-        config_obj = Config(raw=raw_cfg, merged=normalized)
-        _CONFIG = config_obj
-        logger.info("config: loaded config from %s", str(_CONFIG_PATH) if _CONFIG_PATH else "<defaults>")
-        return config_obj
+        cfg_obj = Config(raw=raw, merged=normalized)
+        _CONFIG = cfg_obj
+        logger.info("config: loaded merged config (from=%s)", str(_CONFIG_PATH) if _CONFIG_PATH else "<defaults>")
+        return cfg_obj
 
 def get_config() -> Config:
     global _CONFIG
@@ -405,18 +395,15 @@ def get_config() -> Config:
         return _CONFIG
 
 def reload(explicit_path: Optional[str] = None) -> Config:
-    """Force reload from file (if exists) and notify watchers."""
     cfg = load(explicit_path)
     _notify_watchers(cfg)
     return cfg
 
 # ----------------------------
-# Save API: save only the override (diff) to avoid overwriting defaults and preserve comments
+# Save: write only override (diff) to avoid clobbering defaults
 # ----------------------------
 def _compute_override(merged: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[str, Any]:
-    """Return only the keys in merged that differ from defaults (recursively)."""
     def diff(a: Any, b: Any) -> Any:
-        # if types differ, return a
         if type(a) != type(b):
             return deepcopy(a)
         if isinstance(a, dict):
@@ -433,54 +420,39 @@ def _compute_override(merged: Dict[str, Any], defaults: Dict[str, Any]) -> Dict[
             if a != b:
                 return deepcopy(a)
             return None
-    res = diff(merged, defaults)
-    return res or {}
+    r = diff(merged, defaults)
+    return r or {}
 
-def save(path: Optional[str] = None, save_override_only: bool = True) -> Path:
-    """
-    Save config to file. If save_override_only True, we write only the diff between current merged and DEFAULTS
-    to avoid overwriting defaults and keep the file minimal. If ruamel is available, preserve comments on write.
-    Returns path written.
-    """
+def save(path: Optional[str] = None, override_only: bool = True) -> Path:
     with _CONFIG_LOCK:
         cfg = get_config()
         merged = cfg.as_dict()
         out_path = Path(path) if path else (_CONFIG_PATH or (Path.home() / ".config" / "rquest" / "config.yaml"))
         out_path.parent.mkdir(parents=True, exist_ok=True)
         to_write = merged
-        if save_override_only:
-            override = _compute_override(merged, DEFAULTS)
-            to_write = override
-
+        if override_only:
+            to_write = _compute_override(merged, DEFAULTS) or {}
         try:
             if _HAS_RUAMEL:
                 yaml_obj = ruamel_yaml.YAML()
-                # if existing file and ruamel loaded originally, try to preserve it
-                if out_path.exists():
-                    try:
-                        orig = ruamel_yaml.YAML().load(out_path.read_text(encoding="utf-8"))
-                        # simple replacement: write override into original and dump
-                    except Exception:
-                        orig = None
                 with open(out_path, "w", encoding="utf-8") as fh:
                     yaml_obj.dump(to_write, fh)
             elif _HAS_PYYAML:
                 with open(out_path, "w", encoding="utf-8") as fh:
-                    yaml.safe_dump(to_write, fh, default_flow_style=False, sort_keys=False)
+                    pyyaml.safe_dump(to_write, fh, default_flow_style=False, sort_keys=False)
             else:
                 with open(out_path, "w", encoding="utf-8") as fh:
-                    json.dump(to_write, fh, indent=2)
-            logger.info("config: saved config to %s (override_only=%s)", out_path, save_override_only)
+                    json.dump(to_write, fh, indent=2, ensure_ascii=False)
+            logger.info("config: saved config to %s (override_only=%s)", out_path, override_only)
             return out_path
         except Exception:
-            logger.exception("config: saving config failed")
+            logger.exception("config: failed to save config")
             raise
 
 # ----------------------------
 # Watcher API
 # ----------------------------
 def register_watch_callback(cb: Callable[[Config], None]) -> None:
-    """Register a callback to be invoked when the config changes (callback receives the new Config)."""
     with _CONFIG_LOCK:
         if cb not in _WATCH_CALLBACKS:
             _WATCH_CALLBACKS.append(cb)
@@ -491,37 +463,38 @@ def unregister_watch_callback(cb: Callable[[Config], None]) -> None:
             _WATCH_CALLBACKS.remove(cb)
 
 def _notify_watchers(cfg: Config) -> None:
-    # copy to avoid modification while iterating
     with _CONFIG_LOCK:
-        callbacks = list(_WATCH_CALLBACKS)
-    for cb in callbacks:
+        cbs = list(_WATCH_CALLBACKS)
+    for cb in cbs:
         try:
             cb(cfg)
         except Exception:
-            logger.exception("config: watch callback failed")
+            logger.exception("config: watcher callback error")
 
 class _FSHandler(FileSystemEventHandler):
-    def __init__(self, path: Path):
+    def __init__(self, watched: Path):
         super().__init__()
-        self._path = path
+        self._watched = watched
 
     def on_modified(self, event):
         try:
-            if hasattr(event, "src_path") and Path(event.src_path) == self._path:
-                logger.info("config: file modified, reloading %s", self._path)
-                cfg = reload(str(self._path))
+            src = getattr(event, "src_path", None)
+            if src and Path(src) == self._watched:
+                logger.info("config: detected modification via watchdog, reloading %s", self._watched)
+                cfg = reload(str(self._watched))
                 _notify_watchers(cfg)
         except Exception:
-            logger.exception("config: watcher exception on_modified")
+            logger.exception("config: watchdog handler error")
 
-def _start_watch_thread():
-    global _WATCH_THREAD, _OBSERVER, _CONFIG_PATH
-    if not get_config().merged.get("watch", {}).get("enabled", True):
-        logger.debug("config: watch disabled in configuration")
+def _start_watcher():
+    global _WATCHER_THREAD, _OBSERVER, _CONFIG_PATH, _CONFIG_MTIME
+    cfg = get_config().merged
+    if not cfg.get("watch", {}).get("enabled", True):
+        logger.debug("config: watch disabled by config")
         return
 
-    use_watchdog = get_config().merged.get("watch", {}).get("use_watchdog_if_available", True) and _HAS_WATCHDOG
-    poll_interval = float(get_config().merged.get("watch", {}).get("poll_interval", 2))
+    use_watchdog = cfg.get("watch", {}).get("use_watchdog_if_available", True) and _HAS_WATCHDOG
+    poll_interval = float(cfg.get("watch", {}).get("poll_interval", 2))
 
     if _CONFIG_PATH is None:
         logger.debug("config: no config path to watch")
@@ -535,12 +508,12 @@ def _start_watch_thread():
                 _OBSERVER.schedule(handler, str(_CONFIG_PATH.parent), recursive=False)
                 _OBSERVER.daemon = True
                 _OBSERVER.start()
-                logger.info("config: started watchdog observer for %s", _CONFIG_PATH)
+                logger.info("config: started watchdog observer on %s", _CONFIG_PATH)
             return
         except Exception:
             logger.exception("config: failed to start watchdog, falling back to polling")
 
-    # fallback polling thread
+    # polling fallback
     def _poll_loop():
         global _CONFIG_MTIME
         last = _CONFIG_MTIME
@@ -558,21 +531,19 @@ def _start_watch_thread():
                 logger.exception("config: poll watcher exception")
                 time.sleep(poll_interval)
 
-    if _WATCH_THREAD is None or not _WATCH_THREAD.is_alive():
+    if _WATCHER_THREAD is None or not _WATCHER_THREAD.is_alive():
         t = threading.Thread(target=_poll_loop, daemon=True)
         t.start()
-        _WATCH_THREAD = t
+        _WATCHER_THREAD = t
         logger.info("config: started poll watcher for %s (interval=%s)", _CONFIG_PATH, poll_interval)
 
 # ----------------------------
-# Convenience helpers used by modules
+# Convenience helpers for modules
 # ----------------------------
-def get_module_config(module_name: str) -> Dict[str, Any]:
+def get_module_config(name: str) -> Dict[str, Any]:
     cfg = get_config().merged.get("modules", {})
-    mod = cfg.get(module_name)
-    if isinstance(mod, dict):
-        return deepcopy(mod)
-    return {}
+    val = cfg.get(name)
+    return deepcopy(val) if isinstance(val, dict) else {}
 
 def get_db_path() -> str:
     return _expand_path(get_config().merged.get("db", {}).get("path"))
@@ -584,77 +555,75 @@ def get_fetcher_config() -> Dict[str, Any]:
     return deepcopy(get_config().merged.get("fetcher", {}))
 
 def validate_config() -> Tuple[bool, List[str]]:
-    """Return (ok, list_of_issues). Will perform more exhaustive checks."""
-    cfg = get_config().merged
-    ok, issues = _validate_structure(cfg)
-    # additional checks: directories writable where required
-    extra_issues: List[str] = []
-    # check db path parent writable
-    dbp = cfg.get("db", {}).get("path")
+    ok, issues = _validate_structure(get_config().merged)
+    # extra checks: db parent writable, repos local creatable
+    extra: List[str] = []
+    dbp = get_config().merged.get("db", {}).get("path")
     if dbp:
         parent = Path(_expand_path(dbp)).parent
-        if not parent.exists():
-            try:
-                parent.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                extra_issues.append(f"db.path parent {parent} not writable/creatable")
-        elif not os.access(parent, os.W_OK):
-            extra_issues.append(f"db.path parent {parent} is not writable")
-    # check repos.local
-    rl = cfg.get("repos", {}).get("local")
-    if rl and not os.access(_expand_path(rl), os.F_OK):
-        # try create
+        try:
+            parent.mkdir(parents=True, exist_ok=True)
+            if not os.access(parent, os.W_OK):
+                extra.append(f"db.path parent {parent} not writable")
+        except Exception:
+            extra.append(f"db.path parent {parent} not creatable")
+    rl = get_config().merged.get("repos", {}).get("local")
+    if rl:
         try:
             Path(_expand_path(rl)).mkdir(parents=True, exist_ok=True)
         except Exception:
-            extra_issues.append(f"repos.local {rl} not creatable")
-
-    issues.extend(extra_issues)
+            extra.append(f"repos.local {rl} not creatable")
+    issues.extend(extra)
     return (len(issues) == 0, issues)
 
 # ----------------------------
-# Initialize on import
+# Initialize at import
 # ----------------------------
 try:
     load()
 except Exception:
-    logger.exception("config: initial load failed, continuing with defaults")
+    logger.exception("config: initial load failed, using defaults")
 
-# configure basic logging level from config if available (non-intrusive)
+# Set logging level from config (best-effort)
 try:
-    cfg_level = get_config().merged.get("logging", {}).get("level", "INFO")
-    logger.setLevel(getattr(logging, str(cfg_level).upper(), logging.INFO))
+    level = get_config().merged.get("logging", {}).get("level", "INFO")
+    logger.setLevel(getattr(logging, str(level).upper(), logging.INFO))
 except Exception:
     pass
 
+# Start watcher if configured
 try:
-    _start_watch_thread()
+    _start_watcher()
 except Exception:
     logger.exception("config: failed to start watcher")
 
 # ----------------------------
-# CLI test helper
+# CLI for inspection and quick ops
 # ----------------------------
 if __name__ == "__main__":
-    # simple CLI to print config and validate
     import argparse
-    ap = argparse.ArgumentParser(prog="rquest-config", description="Rquest config inspector")
+    ap = argparse.ArgumentParser(prog="rquest-config", description="Inspect/validate rquest config")
     ap.add_argument("--print", action="store_true", help="print merged config")
-    ap.add_argument("--raw", action="store_true", help="print raw file config only")
+    ap.add_argument("--raw", action="store_true", help="print raw file config only (if file exists)")
     ap.add_argument("--validate", action="store_true", help="validate config and list issues")
     ap.add_argument("--save", help="save current override to path")
+    ap.add_argument("--path", help="explicit config path to load")
     args = ap.parse_args()
+    if args.path:
+        cfg = load(args.path)
+    else:
+        cfg = get_config()
     if args.raw:
-        print(json.dumps(get_config().raw, indent=2, ensure_ascii=False))
+        print(json.dumps(cfg.raw, indent=2, ensure_ascii=False))
     if args.print:
-        print(json.dumps(get_config().merged, indent=2, ensure_ascii=False))
+        print(json.dumps(cfg.merged, indent=2, ensure_ascii=False))
     if args.validate:
         ok, issues = validate_config()
         print("OK:", ok)
         if issues:
             print("Issues:")
-            for i in issues:
-                print(" -", i)
+            for it in issues:
+                print(" -", it)
     if args.save:
         p = save(args.save)
         print("Saved to", p)
