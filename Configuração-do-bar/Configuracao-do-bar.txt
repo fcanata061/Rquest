@@ -1,0 +1,12 @@
+# I3 blocks
+[rquest]
+command=/usr/local/bin/rquest-bar.sh i3blocks
+interval=300
+label=Updates
+
+----------------------------
+ # Lemonbar 
+while true; do
+    /usr/local/bin/rquest-bar.sh lemonbar
+    sleep 300
+done | lemonbar -p
