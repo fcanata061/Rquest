@@ -1,0 +1,79 @@
+package:
+  name: binutils-pass3
+  version: 2.41
+  release: 1
+  category: toolchain
+  summary: "Binutils (passo 3) — instalação definitiva no sistema destino"
+  description: |
+    Terceiro estágio do GNU Binutils. Agora é compilado e instalado dentro do
+    sistema destino (/usr), usando o GCC-pass2 como compilador. Substitui os
+    binários temporários e fornece ferramentas consistentes para o restante
+    da toolchain (glibc, gcc final, etc).
+
+upstream:
+  url: https://ftp.gnu.org/gnu/binutils/binutils-2.41.tar.xz
+  protocol: https
+  checksum: "sha256:fc7b99ecbf5eebf2f61fae50a6f9712b3a793bcee664f645dd5bb7b2d8e9f822"
+
+dependencies:
+  build:
+    - gcc-pass2
+    - make
+    - bash
+    - coreutils
+    - gawk
+    - texinfo
+  runtime: []
+
+environment:
+  variables:
+    PATH: "/usr/bin:/bin"
+
+prepare:
+  steps:
+    - "tar -xf binutils-2.41.tar.xz"
+    - "cd binutils-2.41"
+    - "mkdir -v build && cd build"
+
+build:
+  steps:
+    - "../configure --prefix=/usr \
+        --enable-gold \
+        --enable-ld=default \
+        --enable-plugins \
+        --enable-shared \
+        --disable-werror"
+    - "make -j$(nproc)"
+
+check:
+  steps:
+    - "make -k check || true"
+
+install:
+  steps:
+    - "make install"
+    - "rm -v /usr/lib/lib{bfd,ctf,ctf-nobfd,opcodes}.a"
+
+hooks:
+  pre-configure: []
+  post-configure: []
+  pre-build: []
+  post-build: []
+  pre-install: []
+  post-install:
+    - "echo 'Binutils pass3 instalado em /usr com GCC-pass2'"
+
+files:
+  - "/usr/bin/*"
+  - "/usr/lib/*"
+  - "/usr/include/*"
+
+metadata:
+  maintainer: "Equipe Rquest"
+  license: "GPL-3.0-or-later"
+  homepage: "https://www.gnu.org/software/binutils/"
+  tags:
+    - toolchain
+    - bootstrap
+    - cross-compiler
+    - pass3
