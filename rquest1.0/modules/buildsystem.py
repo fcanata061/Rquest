@@ -1,16 +1,23 @@
-# Rquest/rquest1.0/modules/buildsystem.py
+# rquest1.0/modules/buildsystem.py
+# -*- coding: utf-8 -*-
 """
-buildsystem.py - Build orchestration for Rquest
+buildsystem.py - motor de build do Rquest (versão integrada)
 
-Features:
-- BuildSystem class with full pipeline: prepare -> configure -> compile -> test -> install -> package -> publish -> cleanup
-- Detect multiple build systems (autotools, cmake, meson, python, cargo, generic)
-- Integration with sandbox.py for hermetic execution
-- Integration with fetcher.py, patches.py, hooks.py
-- Use fakeroot.py for install step when configured or requested by pkg_meta
-- Basic caching and DB persistence (builds, build_jobs, build_cache)
-- Hooks executed at each stage: pre_* and post_* via hooks module
-- Robust fallbacks when modules are missing
+API principal:
+  bs = get_buildsystem()
+  result = bs.build_package(pkg_meta: dict, *, force: bool=False, dry_run: bool=False, shards: Optional[int]=None)
+
+Resultado:
+  dict {
+    "ok": True/False,
+    "stage": "prepare|configure|compile|install|package|publish|cleanup|fetch",
+    "detail": {...},  # logs, rc, errmsg, artifacts
+  }
+
+Comportamento:
+  - Integra com modules.fetcher, modules.patches, modules.sandbox, modules.fakeroot, modules.hooks, modules.db, modules.logging, modules.audit quando presentes.
+  - Fallback para executáveis do sistema (wget/curl, tar, make, cmake, python) se módulos faltarem.
+  - Respeita dry_run (simula) e force (ignora falhas conforme apropriado).
 """
 
 from __future__ import annotations
@@ -18,811 +25,705 @@ from __future__ import annotations
 import os
 import sys
 import json
-import time
 import shutil
-import tarfile
-import tempfile
-import threading
-import uuid
 import subprocess
+import tempfile
+import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# ----------------------------
-# Robust imports for project modules
-# ----------------------------
+# optional libs
+try:
+    import yaml  # type: ignore
+except Exception:
+    yaml = None
+
+# --- integrations (graceful) ---
+# config
 try:
     from modules.config import get_config  # type: ignore
 except Exception:
-    try:
-        from config import get_config  # type: ignore
-    except Exception:
-        def get_config():
-            return {}
+    def get_config():
+        return {}
 
+# logging
 try:
     from modules.logging import get_logger  # type: ignore
+    logger = get_logger("buildsystem")
 except Exception:
-    import logging as _stdlog
-    def get_logger(name: str):
-        return _stdlog.getLogger(name)
+    import logging
+    logger = logging.getLogger("rquest.buildsystem")
+    if not logger.handlers:
+        logging.basicConfig(level=logging.INFO)
 
-logger = get_logger("buildsystem")
-
-# DB
+# fetcher
 try:
-    from modules.db import get_db, add_history, emit_event  # type: ignore
+    from modules.fetcher import Fetcher  # type: ignore
 except Exception:
-    def get_db(): return None
-    def add_history(*a, **k): pass
-    def emit_event(*a, **k): pass
+    Fetcher = None
+
+# patches
+try:
+    from modules.patches import PatchManager  # type: ignore
+except Exception:
+    PatchManager = None
 
 # sandbox
 try:
     from modules.sandbox import get_sandbox_manager  # type: ignore
 except Exception:
-    def get_sandbox_manager(): return None
+    def get_sandbox_manager():
+        return None
 
-# fetcher
+# fakeroot
 try:
-    from modules.fetcher import get_fetcher_manager  # type: ignore
+    from modules.fakeroot import create_fakeroot  # type: ignore
 except Exception:
-    def get_fetcher_manager(): return None
-
-# patches
-try:
-    from modules.patches import get_patch_manager  # type: ignore
-except Exception:
-    def get_patch_manager(): return None
+    create_fakeroot = None
 
 # hooks
 try:
     from modules.hooks import get_hook_manager  # type: ignore
 except Exception:
-    def get_hook_manager(): return None
+    get_hook_manager = None
 
-# masks / slots
+# db
 try:
-    from modules.masks import is_masked  # type: ignore
+    from modules.db import get_db, emit_event  # type: ignore
 except Exception:
-    def is_masked(*a, **k): return False
+    get_db = None
+    def emit_event(*a, **k):
+        pass
 
+# audit
 try:
-    from modules.slots import assign_slot  # type: ignore
+    from modules.audit import get_auditor  # type: ignore
 except Exception:
-    def assign_slot(*a, **k): return None
+    get_auditor = None
 
-# fakeroot (optional)
+# repo_sync
 try:
-    from modules.fakeroot import run_in_fakeroot, ensure_fakeroot_available  # type: ignore
+    from modules.repo_sync import sync_all as repo_sync_all  # type: ignore
 except Exception:
-    # fallback implementation: try system fakeroot binary or run normally if not available
-    def ensure_fakeroot_available() -> bool:
-        return shutil.which("fakeroot") is not None
+    repo_sync_all = None
 
-    def run_in_fakeroot(cmd: List[str], cwd: Optional[str]=None, env: Optional[Dict[str,str]]=None, timeout: Optional[int]=None) -> Dict[str,Any]:
-        """
-        Fallback: if system fakeroot exists, run under it; otherwise run directly and warn.
-        Returns dict similar to sandbox.run_in_sandbox result.
-        """
-        from modules.sandbox import get_sandbox_manager as _gsm  # lazy import
-        sm = _gsm()
-        if shutil.which("fakeroot"):
-            docker_cmd = [ "fakeroot" ] + cmd
-            return sm.run_in_sandbox(docker_cmd, cwd=cwd, env=env, timeout=timeout, exec_type="fakeroot")
-        else:
-            logger.warning("fakeroot not available; performing install without fakeroot (may require privileges).")
-            return sm.run_in_sandbox(cmd, cwd=cwd, env=env, timeout=timeout, exec_type="install")
+# --- config and defaults ---
+CFG = get_config() if callable(get_config) else {}
+BUILD_CFG = CFG.get("build", {}) if isinstance(CFG, dict) else {}
+DEFAULT_JOBS = BUILD_CFG.get("jobs", os.cpu_count() or 1)
+KEEP_BUILD_DIRS = BUILD_CFG.get("keep_build_dirs", False)
+DEFAULT_FAKEROOT = BUILD_CFG.get("fakeroot", False)
+CACHE_DIR = Path(BUILD_CFG.get("cache_dir", "/var/cache/rquest/build"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-# ----------------------------
-# Utility helpers
-# ----------------------------
+# --- helpers ---
 def _now_ts() -> int:
     return int(time.time())
 
-def _ensure_dir(path: str):
-    try:
-        os.makedirs(path, exist_ok=True)
-    except Exception:
-        pass
+def _uid() -> str:
+    import uuid
+    return uuid.uuid4().hex[:8]
 
-def _safe_json(obj: Any) -> str:
+def _safe_run(cmd: List[str], cwd: Optional[Path] = None, env: Optional[Dict[str,str]] = None, timeout: Optional[int] = None) -> Tuple[int,str,str]:
+    """Run command and capture output. Returns (rc, stdout, stderr)"""
     try:
-        return json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        return json.dumps(str(obj))
+        logger.debug("RUN: %s (cwd=%s)", " ".join(cmd), str(cwd) if cwd else None)
+        p = subprocess.Popen(cmd, cwd=str(cwd) if cwd else None, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=(env or os.environ), text=True)
+        out, err = p.communicate(timeout=timeout)
+        return p.returncode, out or "", err or ""
+    except subprocess.TimeoutExpired:
+        p.kill()
+        out, err = p.communicate()
+        return 124, out or "", err or ""
+    except Exception as e:
+        logger.exception("Command failed: %s", e)
+        return 1, "", str(e)
 
-# ----------------------------
-# DB schema helpers
-# ----------------------------
-def _ensure_build_tables(db):
-    if not db:
-        logger.debug("No DB available to ensure build tables.")
-        return
-    try:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS builds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                package TEXT,
-                version TEXT,
-                system TEXT,
-                status TEXT,
-                start_ts INTEGER,
-                end_ts INTEGER,
-                duration REAL,
-                log_path TEXT,
-                sandbox_exec_id INTEGER,
-                artifacts_path TEXT,
-                used_fakeroot INTEGER DEFAULT 0,
-                plan_hash TEXT,
-                cache_hit INTEGER DEFAULT 0
-            );
-        """, (), commit=True)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS build_jobs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                package TEXT,
-                version TEXT,
-                status TEXT DEFAULT 'pending',
-                attempts INTEGER DEFAULT 0,
-                worker TEXT,
-                created_at INTEGER DEFAULT (strftime('%s','now')),
-                updated_at INTEGER
-            );
-        """, (), commit=True)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS build_cache (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                digest TEXT UNIQUE,
-                artifact_path TEXT,
-                created_at INTEGER
-            );
-        """, (), commit=True)
-    except Exception:
-        logger.exception("Failed ensuring build tables")
-
-# ----------------------------
-# Build system detection
-# ----------------------------
-def detect_build_system(source_dir: str) -> str:
+# --- detect build system ---
+def detect_build_system(pkg_meta: Dict[str,Any]) -> str:
     """
-    Try to detect build system:
-      - autotools if configure or configure.ac present
-      - cmake if CMakeLists.txt
-      - meson if meson.build
-      - python if setup.py / pyproject.toml
-      - cargo if Cargo.toml
-      - generic otherwise (user-supplied commands)
+    Heuristics:
+      - pkg_meta['build']['system'] explicit
+      - presence of configure, CMakeLists.txt, pyproject.toml/setup.py, Cargo.toml
+      - default -> 'generic'
     """
+    build = pkg_meta.get("build") or {}
+    if isinstance(build, dict) and build.get("system"):
+        return str(build.get("system"))
+    # scan sources if available (pkg_meta may include 'source' tarballs or 'source_dir' hint)
+    src_hint = pkg_meta.get("source_dir") or pkg_meta.get("src_dir") or None
+    # if explicit path exists, check files
+    if src_hint and Path(src_hint).exists():
+        p = Path(src_hint)
+        if (p / "configure").exists() or (p / "autogen.sh").exists():
+            return "autotools"
+        if (p / "CMakeLists.txt").exists():
+            return "cmake"
+        if (p / "pyproject.toml").exists() or (p / "setup.py").exists():
+            return "python"
+        if (p / "Cargo.toml").exists():
+            return "cargo"
+    # metadata hints
+    sources = pkg_meta.get("source") or []
+    # if any source is a git repo and package name contains 'rust' maybe cargo; but keep simple:
+    # fallback: autotools if configure present in top-level after extract is common
+    return "autotools" if isinstance(sources, list) and any(str(s).endswith((".tar.gz", ".tar.xz", ".tar.bz2", ".zip")) for s in sources) else "generic"
+
+# --- environment assembly ---
+def assemble_env(pkg_meta: Dict[str,Any], profile: Optional[str] = None) -> Dict[str,str]:
+    """
+    Build environment variables for the build based on pkg_meta and global config.
+    Merges CFLAGS/CXXFLAGS/LDFLAGS/CPPFLAGS from meta and config.
+    """
+    env = dict(os.environ)
+    meta_build = pkg_meta.get("build", {}) or {}
+    meta_env = meta_build.get("env") or pkg_meta.get("env") or {}
+    # gather flags
+    flags = {}
+    for key in ("CFLAGS","CXXFLAGS","LDFLAGS","CPPFLAGS","MAKEFLAGS"):
+        v = meta_env.get(key) or pkg_meta.get(key) or BUILD_CFG.get(key.lower()) or ""
+        if v:
+            flags[key] = str(v)
+    # merge
+    env.update({k: v for k,v in flags.items() if v})
+    # add JOBS
+    env["JOBS"] = str(pkg_meta.get("build", {}).get("jobs") or BUILD_CFG.get("jobs") or DEFAULT_JOBS)
+    return env
+
+# --- fetch sources ---
+def fetch_sources(pkg_meta: Dict[str,Any], workdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+    """
+    Fetch sources declared in pkg_meta['source'] into workdir/distfiles.
+    Returns dict with ok and list of files.
+    """
+    res = {"ok": True, "files": [], "errors": []}
+    sources = pkg_meta.get("source") or []
+    if isinstance(sources, dict):
+        sources = [sources]
+    if not sources:
+        logger.debug("No sources declared in meta")
+        return res
+    # use Fetcher module if available
+    if Fetcher:
+        try:
+            fetcher = Fetcher(cache_dir=str(CACHE_DIR))
+            for s in sources:
+                if dry_run:
+                    logger.info("[dry-run] would fetch %s", s)
+                    continue
+                try:
+                    path = fetcher.fetch(s)
+                    res["files"].append(path)
+                except Exception as e:
+                    logger.exception("Fetcher failed for %s: %s", s, e)
+                    res["errors"].append({"source": s, "error": str(e)})
+                    res["ok"] = False
+        except Exception:
+            logger.exception("Fetcher module failed; falling back to wget/curl")
+            Fetch_local = None
+    # fallback basic downloader
+    for s in sources:
+        url = s.get("url") if isinstance(s, dict) else s
+        if not url:
+            continue
+        fname = os.path.basename(str(url).split("?")[0])
+        dest = workdir / fname
+        if dest.exists():
+            res["files"].append(str(dest))
+            continue
+        if dry_run:
+            logger.info("[dry-run] would download %s -> %s", url, dest)
+            continue
+        if shutil.which("wget"):
+            rc, out, err = _safe_run(["wget", "-c", "-O", str(dest), url], cwd=workdir)
+        elif shutil.which("curl"):
+            rc, out, err = _safe_run(["curl", "-L", "-o", str(dest), url], cwd=workdir)
+        else:
+            rc, out, err = 1, "", "no-downloader"
+        if rc != 0:
+            logger.warning("Failed to download %s: %s", url, err.strip())
+            res["errors"].append({"source": url, "err": err})
+            res["ok"] = False
+        else:
+            res["files"].append(str(dest))
+    return res
+
+# --- apply patches ---
+def apply_patches(pkg_meta: Dict[str,Any], workdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+    res = {"ok": True, "applied": [], "errors": []}
+    patches = pkg_meta.get("patches") or pkg_meta.get("prepare", {}).get("patches") or []
+    if not patches:
+        return res
+    if PatchManager:
+        try:
+            pm = PatchManager()
+            for p in patches:
+                if dry_run:
+                    logger.info("[dry-run] would apply patch %s", p)
+                    continue
+                ok = pm.apply(p, cwd=str(workdir))
+                if ok:
+                    res["applied"].append(p)
+                else:
+                    res["errors"].append({"patch": p, "error": "apply-failed"})
+                    res["ok"] = False
+        except Exception:
+            logger.exception("PatchManager failed; fallback to 'patch' command")
+    # fallback to using 'patch' where possible (patch files must be in workdir)
+    for p in patches:
+        patch_path = Path(p) if isinstance(p, str) else None
+        if not patch_path or not patch_path.exists():
+            # maybe patch located relative to meta: skip gracefully
+            logger.warning("Patch not found: %s", p)
+            res["errors"].append({"patch": p, "error": "not-found"})
+            res["ok"] = False
+            continue
+        if dry_run:
+            logger.info("[dry-run] would apply patch %s", patch_path)
+            continue
+        rc, out, err = _safe_run(["patch", "-p1", "-i", str(patch_path)], cwd=workdir)
+        if rc != 0:
+            res["errors"].append({"patch": p, "err": err})
+            res["ok"] = False
+        else:
+            res["applied"].append(str(patch_path))
+    return res
+
+# --- run hooks ---
+def run_hooks(hooks_phase: str, pkg_meta: Dict[str,Any], cwd: Path, env: Dict[str,str], dry_run: bool=False) -> Dict[str,Any]:
+    """
+    hooks_phase: pre-fetch, post-fetch, pre-configure, post-configure, pre-build, post-build, pre-install, post-install
+    pkg_meta may include hooks inline or reference scripts under package dir.
+    """
+    res = {"ok": True, "ran": [], "errors": []}
+    hooks_def = (pkg_meta.get("hooks") or {}).get(hooks_phase) or []
+    if not hooks_def and get_hook_manager:
+        try:
+            hm = get_hook_manager()()
+            hooks_def = hm.get_hooks_for(pkg_meta.get("package", {}).get("name"), hooks_phase) or []
+        except Exception:
+            pass
+    for h in hooks_def:
+        if dry_run:
+            logger.info("[dry-run] would run hook %s: %s", hooks_phase, h)
+            continue
+        try:
+            # allow shell commands or script paths
+            if isinstance(h, str):
+                rc, out, err = _safe_run(h.split(), cwd=cwd, env=env)
+            else:
+                rc, out, err = _safe_run(list(h), cwd=cwd, env=env)
+            if rc != 0:
+                res["errors"].append({"hook": h, "rc": rc, "err": err})
+                res["ok"] = False
+            else:
+                res["ran"].append({"hook": h, "out": out})
+        except Exception as e:
+            res["errors"].append({"hook": h, "error": str(e)})
+            res["ok"] = False
+    return res
+
+# --- configure / build / test / install helpers ---
+def run_configure(pkg_meta: Dict[str,Any], srcdir: Path, builddir: Optional[Path], env: Dict[str,str], dry_run: bool=False) -> Dict[str,Any]:
+    build = pkg_meta.get("build", {}) or {}
+    system = build.get("system") or detect_build_system(pkg_meta)
+    res = {"ok": True, "cmds": []}
+    if system == "autotools":
+        cfg = build.get("configure") or build.get("args") or ["../configure --prefix=/usr"]
+        # support out-of-source
+        bdir = builddir or srcdir
+        if not bdir.exists(): bdir.mkdir(parents=True, exist_ok=True)
+        for cmd in (cfg if isinstance(cfg, list) else [cfg]):
+            if dry_run:
+                logger.info("[dry-run] would run configure: %s", cmd)
+                res["cmds"].append(cmd)
+                continue
+            cmd_list = cmd.split()
+            rc, out, err = _safe_run(cmd_list, cwd=bdir, env=env)
+            res["cmds"].append({"cmd": cmd, "rc": rc, "out": out, "err": err})
+            if rc != 0:
+                res["ok"] = False
+                return res
+    elif system == "cmake":
+        bdir = builddir or (srcdir / "build")
+        if not bdir.exists(): bdir.mkdir(parents=True, exist_ok=True)
+        cfg = build.get("configure") or ["cmake .. -DCMAKE_INSTALL_PREFIX=/usr"]
+        for cmd in (cfg if isinstance(cfg, list) else [cfg]):
+            if dry_run:
+                logger.info("[dry-run] would run cmake: %s", cmd)
+                res["cmds"].append(cmd)
+                continue
+            rc, out, err = _safe_run(cmd.split(), cwd=bdir, env=env)
+            res["cmds"].append({"cmd": cmd, "rc": rc, "out": out, "err": err})
+            if rc != 0:
+                res["ok"] = False
+                return res
+    elif system == "python":
+        # build with pip wheel or setup.py
+        cmd = build.get("commands") or ["python -m pip wheel . -w dist"]
+        for c in (cmd if isinstance(cmd, list) else [cmd]):
+            if dry_run:
+                logger.info("[dry-run] would run python build: %s", c)
+                res["cmds"].append(c)
+                continue
+            rc, out, err = _safe_run(c.split(), cwd=srcdir, env=env)
+            res["cmds"].append({"cmd": c, "rc": rc, "out": out, "err": err})
+            if rc != 0:
+                res["ok"] = False
+                return res
+    elif system == "cargo":
+        cmd = build.get("commands") or ["cargo build --release"]
+        for c in (cmd if isinstance(cmd, list) else [cmd]):
+            if dry_run:
+                logger.info("[dry-run] would run cargo: %s", c)
+                res["cmds"].append(c)
+                continue
+            rc, out, err = _safe_run(c.split(), cwd=srcdir, env=env)
+            res["cmds"].append({"cmd": c, "rc": rc, "out": out, "err": err})
+            if rc != 0:
+                res["ok"] = False
+                return res
+    else:
+        # generic: respect build.commands or make by default
+        cmds = build.get("commands") or build.get("steps") or ["make -j{}".format(env.get("JOBS", DEFAULT_JOBS))]
+        for c in (cmds if isinstance(cmds, list) else [cmds]):
+            if dry_run:
+                logger.info("[dry-run] would run build step: %s", c)
+                res["cmds"].append(c)
+                continue
+            rc, out, err = _safe_run(c.split(), cwd=builddir or srcdir, env=env)
+            res["cmds"].append({"cmd": c, "rc": rc, "out": out, "err": err})
+            if rc != 0:
+                res["ok"] = False
+                return res
+    return res
+
+def run_make_install(srcdir: Path, builddir: Optional[Path], env: Dict[str,str], use_fakeroot: bool=False, dry_run: bool=False) -> Dict[str,Any]:
+    res = {"ok": True, "cmds": []}
+    inst = ["make", "install"]
+    if dry_run:
+        logger.info("[dry-run] would run install: %s", " ".join(inst))
+        res["cmds"].append(" ".join(inst))
+        return res
+    # if fakeroot available and requested, use it
+    if use_fakeroot and create_fakeroot:
+        try:
+            fr = create_fakeroot()
+            rc, out, err = fr.run(inst, cwd=str(builddir or srcdir), env=env)
+        except Exception:
+            logger.exception("fakeroot.run failed; falling back to direct install")
+            rc, out, err = _safe_run(inst, cwd=builddir or srcdir, env=env)
+    else:
+        rc, out, err = _safe_run(inst, cwd=builddir or srcdir, env=env)
+    res["cmds"].append({"cmd": " ".join(inst), "rc": rc, "out": out, "err": err})
+    if rc != 0:
+        res["ok"] = False
+    return res
+
+# --- packaging (quickpkg) ---
+def quickpkg(pkg_meta: Dict[str,Any], build_root: Path, output_dir: Path) -> Dict[str,Any]:
+    """
+    Create a simple tarball of installed files listed in pkg_meta['install']['paths'] or 'files'
+    """
+    out = {"ok": True, "artifact": None, "error": None}
+    name = pkg_meta.get("package", {}).get("name") or f"pkg-{_uid()}"
+    version = pkg_meta.get("package", {}).get("version") or "0"
+    tarname = f"{name}-{version}.tar.gz"
+    tarpath = output_dir / tarname
     try:
-        files = set(os.listdir(source_dir))
-    except Exception:
-        files = set()
-    if "configure" in files or "configure.ac" in files or "configure.in" in files:
-        return "autotools"
-    if "CMakeLists.txt" in files:
-        return "cmake"
-    if "meson.build" in files:
-        return "meson"
-    if "pyproject.toml" in files or "setup.py" in files:
-        return "python"
-    if "Cargo.toml" in files:
-        return "cargo"
-    return "generic"
+        paths = pkg_meta.get("install", {}).get("paths") or pkg_meta.get("files") or []
+        if not paths:
+            # fallback: archive entire build_root
+            if dry_run := pkg_meta.get("_dry_run_flag"):  # not ideal; keep safe
+                logger.info("[dry-run] would package %s", build_root)
+            else:
+                shutil.make_archive(str(tarpath.with_suffix("")), "gztar", root_dir=str(build_root))
+                out["artifact"] = str(tarpath)
+                return out
+        # else, construct a tar with listed files
+        import tarfile
+        with tarfile.open(str(tarpath), "w:gz") as tf:
+            for p in paths:
+                pth = Path(p)
+                if pth.exists():
+                    tf.add(str(pth), arcname=str(pth.relative_to("/")) if pth.is_absolute() else pth.name)
+        out["artifact"] = str(tarpath)
+        return out
+    except Exception as e:
+        logger.exception("quickpkg failed: %s", e)
+        out["ok"] = False
+        out["error"] = str(e)
+        return out
 
-# ----------------------------
-# Builder implementations (simple adapters)
-# ----------------------------
-class BaseBuilder:
-    def __init__(self, pkg_meta: Dict[str,Any], source_dir: str, build_dir: str, destdir: str, bs: "BuildSystem"):
-        self.pkg_meta = pkg_meta
-        self.source_dir = source_dir
-        self.build_dir = build_dir
-        self.destdir = destdir
-        self.bs = bs  # Back reference to BuildSystem
-
-    def prepare(self):
-        return {"ok": True, "msg": "no-op"}
-
-    def configure(self):
-        return {"ok": True, "msg": "no-op"}
-
-    def compile(self, jobs: int = 1):
-        return {"ok": True, "msg": "no-op"}
-
-    def test(self):
-        return {"ok": True, "msg": "no-op"}
-
-    def install(self, use_fakeroot: bool = False):
-        return {"ok": True, "msg": "no-op"}
-
-    def package(self):
-        return {"ok": True, "artifact": None}
-
-class AutotoolsBuilder(BaseBuilder):
-    def prepare(self):
-        # usually nothing special
-        return {"ok": True}
-
-    def configure(self):
-        cfg = self.pkg_meta.get("build", {}).get("configure_args", []) or []
-        env = self.bs._assemble_env(self.pkg_meta)
-        cmd = ["./configure", f"--prefix=/usr"] + cfg
-        logger.info("Autotools configure: %s", cmd)
-        sm = get_sandbox_manager()
-        session = self.bs._session_id
-        res = sm.run_in_sandbox(cmd, cwd=self.build_dir, env=env, timeout=self.bs.stage_timeout("configure"), session_id=session, exec_type="configure")
-        return res
-
-    def compile(self, jobs: int = 1):
-        make = self.pkg_meta.get("build", {}).get("make", "make")
-        makeflags = self.pkg_meta.get("build", {}).get("makeflags", []) or []
-        cmd = [make, f"-j{jobs}"] + makeflags
-        sm = get_sandbox_manager()
-        session = self.bs._session_id
-        res = sm.run_in_sandbox(cmd, cwd=self.build_dir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("compile"), session_id=session, exec_type="compile")
-        return res
-
-    def install(self, use_fakeroot: bool = False):
-        make = self.pkg_meta.get("build", {}).get("make", "make")
-        dest = self.destdir
-        cmd = [make, "install", f"DESTDIR={dest}"]
-        if use_fakeroot:
-            # use fakeroot wrapper
-            logger.info("Installing via fakeroot into %s", dest)
-            return run_in_fakeroot(cmd, cwd=self.build_dir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("install"))
-        else:
-            sm = get_sandbox_manager()
-            session = self.bs._session_id
-            return sm.run_in_sandbox(cmd, cwd=self.build_dir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("install"), session_id=session, exec_type="install")
-
-class CMakeBuilder(BaseBuilder):
-    def configure(self):
-        cmake_args = self.pkg_meta.get("build", {}).get("cmake_args", []) or []
-        builddir = self.build_dir
-        os.makedirs(builddir, exist_ok=True)
-        cmd = ["cmake", self.source_dir] + cmake_args
-        sm = get_sandbox_manager()
-        session = self.bs._session_id
-        return sm.run_in_sandbox(cmd, cwd=builddir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("configure"), session_id=session, exec_type="configure")
-
-    def compile(self, jobs: int = 1):
-        cmd = ["cmake", "--build", ".", "--", f"-j{jobs}"]
-        sm = get_sandbox_manager()
-        session = self.bs._session_id
-        return sm.run_in_sandbox(cmd, cwd=self.build_dir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("compile"), session_id=session, exec_type="compile")
-
-    def install(self, use_fakeroot: bool = False):
-        cmd = ["cmake", "--install", ".", "--prefix", "/usr"]
-        if use_fakeroot:
-            return run_in_fakeroot(cmd, cwd=self.build_dir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("install"))
-        else:
-            sm = get_sandbox_manager()
-            session = self.bs._session_id
-            return sm.run_in_sandbox(cmd, cwd=self.build_dir, env=self.bs._assemble_env(self.pkg_meta), timeout=self.bs.stage_timeout("install"), session_id=session, exec_type="install")
-
-# other builder classes (Meson, Python, Cargo) could be implemented similarly as needed
-
-# ----------------------------
-# BuildSystem core (part 1)
-# ----------------------------
+# --- main BuildSystem class ---
 class BuildSystem:
     def __init__(self):
-        self._cfg = {}
-        try:
-            self._cfg = get_config() if callable(get_config) else {}
-        except Exception:
-            self._cfg = {}
-        bs_cfg = {}
-        try:
-            if isinstance(self._cfg, dict):
-                bs_cfg = self._cfg.get("buildsystem", {}) or {}
-            elif hasattr(self._cfg, "as_dict"):
-                bs_cfg = self._cfg.as_dict().get("buildsystem", {}) or {}
-            else:
-                bs_cfg = getattr(self._cfg, "buildsystem", {}) or {}
-        except Exception:
-            bs_cfg = {}
+        self.cfg = CFG
+        self.fetcher = Fetcher(cache_dir=str(CACHE_DIR)) if Fetcher else None
+        self.patchmgr = PatchManager() if PatchManager else None
+        self.sandbox = get_sandbox_manager()() if callable(get_sandbox_manager) else None
+        self.hooks = get_hook_manager()() if callable(get_hook_manager) else None
+        self.db = get_db()() if callable(get_db) else None
+        self.auditor = get_auditor()() if callable(get_auditor) else None
 
-        self.parallel_jobs = int(bs_cfg.get("parallel_jobs", 4))
-        self.use_sandbox = bool(bs_cfg.get("sandbox", True))
-        self.keep_build_dirs = bool(bs_cfg.get("keep_build_dirs", False))
-        self.cache_dir = os.path.abspath(bs_cfg.get("cache_dir", os.path.join(os.getcwd(), ".rquest_build_cache")))
-        _ensure_dir(self.cache_dir)
-        self.package_output = os.path.abspath(bs_cfg.get("package_output", bs_cfg.get("package_output", os.path.join(os.getcwd(), "packages"))))
-        _ensure_dir(self.package_output)
-        self.default_builder = bs_cfg.get("default_builder", "autotools")
-        self._db = get_db() if callable(get_db) else None
-        _ensure_build_tables(self._db)
-        # managers
-        self._sandbox = get_sandbox_manager() if callable(get_sandbox_manager) else None
-        self._fetcher = get_fetcher_manager() if callable(get_fetcher_manager) else None
-        self._patcher = get_patch_manager() if callable(get_patch_manager) else None
-        self._hooks = get_hook_manager() if callable(get_hook_manager) else None
-        # internal
-        self._session_id: Optional[str] = None
-        self._lock = threading.RLock()
-        # timeouts
-        self._stage_timeouts = bs_cfg.get("stage_timeouts", {"configure":1800, "compile":7200, "install":1800, "package":600})
-        # retries
-        self._retries = int(bs_cfg.get("retries", 1))
+    def prepare_workdir(self, pkg_meta: Dict[str,Any]) -> Path:
+        tmp = Path(tempfile.mkdtemp(prefix=f"rquest-build-{pkg_meta.get('package',{}).get('name','pkg')}-"))
+        return tmp
 
-    def stage_timeout(self, stage: str) -> int:
-        return int(self._stage_timeouts.get(stage, 3600))
+    def fetch(self, pkg_meta: Dict[str,Any], workdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+        # run pre-fetch hooks
+        env = assemble_env(pkg_meta)
+        run_hooks("pre-fetch", pkg_meta, workdir, env, dry_run=dry_run)
+        res = fetch_sources(pkg_meta, workdir, dry_run=dry_run)
+        run_hooks("post-fetch", pkg_meta, workdir, env, dry_run=dry_run)
+        return res
 
-    # ----------------------------
-    # env assembly for builds
-    # ----------------------------
-    def _assemble_env(self, pkg_meta: Dict[str,Any]) -> Dict[str,str]:
-        env = os.environ.copy()
-        buildcfg = pkg_meta.get("build", {}) or {}
-        cflags = " ".join(buildcfg.get("cflags", []) or [])
-        ldflags = " ".join(buildcfg.get("ldflags", []) or [])
-        cppflags = " ".join(buildcfg.get("cppflags", []) or [])
-        if cflags:
-            env["CFLAGS"] = env.get("CFLAGS","") + (" " + cflags if env.get("CFLAGS") else cflags)
-        if ldflags:
-            env["LDFLAGS"] = env.get("LDFLAGS","") + (" " + ldflags if env.get("LDFLAGS") else ldflags)
-        if cppflags:
-            env["CPPFLAGS"] = env.get("CPPFLAGS","") + (" " + cppflags if env.get("CPPFLAGS") else cppflags)
-        # set MAKEFLAGS
-        makeflags = buildcfg.get("makeflags", [])
-        if makeflags:
-            env["MAKEFLAGS"] = " ".join(makeflags)
-        # reproducible build fixes
-        if pkg_meta.get("reproducible"):
-            env["SOURCE_DATE_EPOCH"] = str(pkg_meta.get("source_date_epoch", int(time.time())))
-        return env
-      # continuation of Rquest/rquest1.0/modules/buildsystem.py (PART 2)
+    def prepare(self, pkg_meta: Dict[str,Any], workdir: Path, dry_run: bool=False) -> Dict[str,Any]:
+        env = assemble_env(pkg_meta)
+        # run prepare steps: apply patches, custom scripts
+        run_hooks("pre-prepare", pkg_meta, workdir, env, dry_run=dry_run)
+        p_res = apply_patches(pkg_meta, workdir, dry_run=dry_run)
+        if not p_res.get("ok"):
+            return {"ok": False, "stage": "prepare", "detail": p_res}
+        # optional prepare scripts
+        prepare_steps = (pkg_meta.get("prepare") or {}).get("steps") or []
+        for step in prepare_steps:
+            if dry_run:
+                logger.info("[dry-run] would run prepare step: %s", step)
+                continue
+            rc, out, err = _safe_run(step.split(), cwd=workdir, env=env)
+            if rc != 0:
+                return {"ok": False, "stage": "prepare", "detail": {"cmd": step, "rc": rc, "err": err}}
+        run_hooks("post-prepare", pkg_meta, workdir, env, dry_run=dry_run)
+        return {"ok": True}
 
-    # ----------------------------
-    # prepare: fetch sources & extract to build dir
-    # ----------------------------
-    def prepare(self, pkg_meta: Dict[str,Any], *, force: bool=False) -> Dict[str,Any]:
-        """
-        Ensure sources available and copied to build_dir. Returns dict with keys:
-        ok, source_dir, build_dir, destdir
-        """
-        pkg_name = pkg_meta.get("name")
-        version = pkg_meta.get("version")
-        source_spec = pkg_meta.get("source")  # expected: url or local path or dict
-        if not pkg_name or not version:
-            return {"ok": False, "error": "pkg_meta missing name/version"}
+    def configure(self, pkg_meta: Dict[str,Any], srcdir: Path, builddir: Optional[Path], dry_run: bool=False) -> Dict[str,Any]:
+        env = assemble_env(pkg_meta)
+        run_hooks("pre-configure", pkg_meta, srcdir, env, dry_run=dry_run)
+        cfg_res = run_configure(pkg_meta, srcdir, builddir, env, dry_run=dry_run)
+        if not cfg_res.get("ok"):
+            return {"ok": False, "stage": "configure", "detail": cfg_res}
+        run_hooks("post-configure", pkg_meta, srcdir, env, dry_run=dry_run)
+        return {"ok": True, "detail": cfg_res}
 
-        build_root = os.path.join(self.cache_dir, f"{pkg_name}-{version}")
-        # clean build_root unless keep_build_dirs or force false?
-        if force and os.path.exists(build_root):
-            shutil.rmtree(build_root, ignore_errors=True)
-        _ensure_dir(build_root)
+    def compile(self, pkg_meta: Dict[str,Any], srcdir: Path, builddir: Optional[Path], shards: Optional[int]=None, dry_run: bool=False) -> Dict[str,Any]:
+        env = assemble_env(pkg_meta)
+        run_hooks("pre-build", pkg_meta, srcdir, env, dry_run=dry_run)
+        # derive compile step via run_configure (system==autotools or generic make)
+        compile_res = run_configure(pkg_meta, srcdir, builddir, env, dry_run=dry_run)
+        if not compile_res.get("ok"):
+            return {"ok": False, "stage": "compile", "detail": compile_res}
+        run_hooks("post-build", pkg_meta, srcdir, env, dry_run=dry_run)
+        return {"ok": True, "detail": compile_res}
 
-        # fetch sources using fetcher manager
-        src_path = None
-        if isinstance(source_spec, dict):
-            url = source_spec.get("url") or source_spec.get("path")
-            checksum = source_spec.get("checksum")
-        else:
-            url = source_spec
-            checksum = None
+    def test(self, pkg_meta: Dict[str,Any], srcdir: Path, builddir: Optional[Path], dry_run: bool=False) -> Dict[str,Any]:
+        run_hooks("pre-test", pkg_meta, srcdir, assemble_env(pkg_meta), dry_run=dry_run)
+        tests = (pkg_meta.get("test") or {}).get("commands") or pkg_meta.get("build", {}).get("test") or []
+        if not tests:
+            return {"ok": True, "skipped": True}
+        results = []
+        for t in (tests if isinstance(tests, list) else [tests]):
+            if dry_run:
+                logger.info("[dry-run] would run test: %s", t)
+                results.append({"cmd": t, "skipped": True})
+                continue
+            rc, out, err = _safe_run(t.split(), cwd=builddir or srcdir, env=assemble_env(pkg_meta))
+            results.append({"cmd": t, "rc": rc, "out": out, "err": err})
+            if rc != 0:
+                return {"ok": False, "stage": "test", "detail": results}
+        run_hooks("post-test", pkg_meta, srcdir, assemble_env(pkg_meta), dry_run=dry_run)
+        return {"ok": True, "detail": results}
 
-        if self._fetcher and url:
-            fm = self._fetcher
-            try:
-                fetch_res = fm.fetch_source(pkg_name, version, url, checksums=checksum, force=force)
-                if not fetch_res.get("ok"):
-                    logger.error("fetch failed for %s %s: %s", pkg_name, version, fetch_res.get("error"))
-                    return {"ok": False, "error": "fetch_failed", "detail": fetch_res}
-                src_path = fetch_res.get("path")
-            except Exception:
-                logger.exception("fetcher.fetch_source exception")
-                return {"ok": False, "error": "fetch_exception"}
-        else:
-            # fallback: if url is local path
-            if url and os.path.exists(url):
-                src_path = url
-            else:
-                logger.warning("No fetcher available and source not local. Aborting prepare.")
-                return {"ok": False, "error": "no_source"}
-
-        # extract/copy into build_dir
-        build_dir = os.path.join(build_root, "work")
-        if os.path.exists(build_dir) and not force:
-            logger.info("Using existing build_dir %s", build_dir)
-        else:
-            if os.path.exists(build_dir):
-                shutil.rmtree(build_dir, ignore_errors=True)
-            _ensure_dir(build_dir)
-            # if src_path is archive, extract; if dir, copy
-            try:
-                if os.path.isdir(src_path):
-                    shutil.copytree(src_path, build_dir, dirs_exist_ok=True)
-                else:
-                    # try extracting common archive formats
+    def install(self, pkg_meta: Dict[str,Any], srcdir: Path, builddir: Optional[Path], dry_run: bool=False, use_fakeroot: bool=False) -> Dict[str,Any]:
+        env = assemble_env(pkg_meta)
+        run_hooks("pre-install", pkg_meta, srcdir, env, dry_run=dry_run)
+        # allow pkg_meta['install']['commands'] override
+        install_def = (pkg_meta.get("install") or {}).get("commands") or (pkg_meta.get("install") or {}).get("steps") or None
+        if install_def:
+            results = []
+            for cmd in (install_def if isinstance(install_def, list) else [install_def]):
+                if dry_run:
+                    logger.info("[dry-run] would run install: %s", cmd)
+                    results.append({"cmd": cmd, "skipped": True})
+                    continue
+                parts = cmd.split()
+                if use_fakeroot and create_fakeroot:
                     try:
-                        if tarfile.is_tarfile(src_path):
-                            with tarfile.open(src_path, "r:*") as tar:
-                                tar.extractall(build_dir)
-                        else:
-                            # copy single file into build_dir
-                            shutil.copy2(src_path, build_dir)
+                        fr = create_fakeroot()
+                        rc, out, err = fr.run(parts, cwd=str(builddir or srcdir), env=env)
                     except Exception:
-                        # fallback copy
-                        shutil.copy2(src_path, build_dir)
-            except Exception:
-                logger.exception("Failed to prepare build dir from %s", src_path)
-                return {"ok": False, "error": "extract_failed"}
+                        logger.exception("fakeroot.run failed; fallback to direct install")
+                        rc, out, err = _safe_run(parts, cwd=builddir or srcdir, env=env)
+                else:
+                    rc, out, err = _safe_run(parts, cwd=builddir or srcdir, env=env)
+                results.append({"cmd": cmd, "rc": rc, "out": out, "err": err})
+                if rc != 0:
+                    run_hooks("install-failed", pkg_meta, srcdir, env, dry_run=dry_run)
+                    return {"ok": False, "stage": "install", "detail": results}
+            run_hooks("post-install", pkg_meta, srcdir, env, dry_run=dry_run)
+            return {"ok": True, "detail": results}
+        # default: make install
+        res = run_make_install(srcdir, builddir, env, use_fakeroot=use_fakeroot, dry_run=dry_run)
+        if not res.get("ok"):
+            return {"ok": False, "stage": "install", "detail": res}
+        run_hooks("post-install", pkg_meta, srcdir, env, dry_run=dry_run)
+        return {"ok": True, "detail": res}
 
-        # create destdir for install
-        destdir = os.path.join(build_root, "dest")
-        _ensure_dir(destdir)
-
-        # store session id for this build (one session per build for reuse)
-        if self.use_sandbox and self._sandbox:
-            self._session_id = self._sandbox.start_session()
-        else:
-            self._session_id = None
-
-        # run pre_prepare hooks
-        if self._hooks:
-            try:
-                self._hooks.run("pre_prepare", context={"pkg_meta": pkg_meta, "build_dir": build_dir}, package=pkg_name)
-            except Exception:
-                logger.exception("pre_prepare hooks failed: continuing")
-
-        # apply patches
-        if self._patcher:
-            try:
-                patch_res = self._patcher.apply_patches(pkg_name, version, build_dir, dry_run=False, sandbox=bool(self._session_id), abort_on_fail=True)
-                if not patch_res.get("ok"):
-                    logger.error("apply_patches failed for %s: %s", pkg_name, patch_res)
-                    return {"ok": False, "error": "patch_failed", "detail": patch_res}
-            except Exception:
-                logger.exception("patch apply exception")
-                return {"ok": False, "error": "patch_exception"}
-
-        # post_prepare hooks
-        if self._hooks:
-            try:
-                self._hooks.run("post_prepare", context={"pkg_meta": pkg_meta, "build_dir": build_dir}, package=pkg_name)
-            except Exception:
-                logger.exception("post_prepare hooks failed: continuing")
-
-        return {"ok": True, "source_dir": src_path, "build_dir": build_dir, "destdir": destdir, "session_id": self._session_id}
-
-    # ----------------------------
-    # configure step
-    # ----------------------------
-    def configure(self, pkg_meta: Dict[str,Any], build_dir: str) -> Dict[str,Any]:
-        pkg_name = pkg_meta.get("name")
-        version = pkg_meta.get("version")
-        builder_type = pkg_meta.get("build", {}).get("system") or detect_build_system(build_dir) or self.default_builder
-        builder = self._create_builder(builder_type, pkg_meta, build_dir, build_dir, os.path.join(os.path.dirname(build_dir), "dest"))
-        # pre_configure hooks
-        if self._hooks:
-            try:
-                self._hooks.run("pre_configure", context={"pkg_meta": pkg_meta, "build_dir": build_dir}, package=pkg_name)
-            except Exception:
-                logger.exception("pre_configure hook failed")
-        res = builder.configure()
-        # post_configure hooks
-        if self._hooks:
-            try:
-                self._hooks.run("post_configure", context={"pkg_meta": pkg_meta, "build_dir": build_dir, "result": res}, package=pkg_name)
-            except Exception:
-                logger.exception("post_configure hook failed")
-        return res
-
-    # ----------------------------
-    # compile step
-    # ----------------------------
-    def compile(self, pkg_meta: Dict[str,Any], build_dir: str, jobs: Optional[int] = None) -> Dict[str,Any]:
-        pkg_name = pkg_meta.get("name")
-        jobs = jobs or pkg_meta.get("build", {}).get("jobs") or self.parallel_jobs
-        builder_type = pkg_meta.get("build", {}).get("system") or detect_build_system(build_dir) or self.default_builder
-        builder = self._create_builder(builder_type, pkg_meta, build_dir, build_dir, os.path.join(os.path.dirname(build_dir), "dest"))
-        # pre_compile hooks
-        if self._hooks:
-            try:
-                self._hooks.run("pre_compile", context={"pkg_meta": pkg_meta, "build_dir": build_dir}, package=pkg_name)
-            except Exception:
-                logger.exception("pre_compile hook failed")
-        res = builder.compile(jobs=int(jobs))
-        # post_compile hooks
-        if self._hooks:
-            try:
-                self._hooks.run("post_compile", context={"pkg_meta": pkg_meta, "build_dir": build_dir, "result": res}, package=pkg_name)
-            except Exception:
-                logger.exception("post_compile hook failed")
-        return res
-
-    # ----------------------------
-    # test step
-    # ----------------------------
-    def test(self, pkg_meta: Dict[str,Any], build_dir: str) -> Dict[str,Any]:
-        pkg_name = pkg_meta.get("name")
-        builder_type = pkg_meta.get("build", {}).get("system") or detect_build_system(build_dir) or self.default_builder
-        builder = self._create_builder(builder_type, pkg_meta, build_dir, build_dir, os.path.join(os.path.dirname(build_dir), "dest"))
-        if self._hooks:
-            try:
-                self._hooks.run("pre_test", context={"pkg_meta": pkg_meta, "build_dir": build_dir}, package=pkg_name)
-            except Exception:
-                logger.exception("pre_test hook failed")
-        res = builder.test()
-        if self._hooks:
-            try:
-                self._hooks.run("post_test", context={"pkg_meta": pkg_meta, "build_dir": build_dir, "result": res}, package=pkg_name)
-            except Exception:
-                logger.exception("post_test hook failed")
-        return res
-
-    # ----------------------------
-    # install step (uses fakeroot if requested)
-    # ----------------------------
-    def install(self, pkg_meta: Dict[str,Any], build_dir: str, destdir: Optional[str]=None, use_fakeroot: Optional[bool]=None) -> Dict[str,Any]:
-        pkg_name = pkg_meta.get("name")
-        version = pkg_meta.get("version")
-        destdir = destdir or os.path.join(os.path.dirname(build_dir), "dest")
-        use_fakeroot = True if (use_fakeroot is None and (self._cfg.get("buildsystem",{}).get("use_fakeroot") or pkg_meta.get("build",{}).get("use_fakeroot"))) else bool(use_fakeroot)
-        builder_type = pkg_meta.get("build", {}).get("system") or detect_build_system(build_dir) or self.default_builder
-        builder = self._create_builder(builder_type, pkg_meta, build_dir, build_dir, destdir)
-        # pre_install hooks
-        if self._hooks:
-            try:
-                self._hooks.run("pre_install", context={"pkg_meta": pkg_meta, "build_dir": build_dir, "destdir": destdir}, package=pkg_name)
-            except Exception:
-                logger.exception("pre_install hook failed")
-        # perform install
-        res = builder.install(use_fakeroot=use_fakeroot)
-        # Mark in DB that fakeroot used
+    def package(self, pkg_meta: Dict[str,Any], build_root: Path, output_dir: Path, dry_run: bool=False) -> Dict[str,Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        # quickpkg
         try:
-            if self._db:
-                self._db.execute("INSERT INTO builds (package, version, system, status, start_ts, end_ts, duration, used_fakeroot) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                                 (pkg_name, version, builder_type, "install-step", int(time.time()), int(time.time()), 0.0, int(use_fakeroot)), commit=True)
-        except Exception:
-            logger.exception("Failed to note fakeroot usage in DB")
-        # post_install hooks
-        if self._hooks:
-            try:
-                self._hooks.run("post_install", context={"pkg_meta": pkg_meta, "build_dir": build_dir, "destdir": destdir, "result": res}, package=pkg_name)
-            except Exception:
-                logger.exception("post_install hook failed")
-        return res
+            qp = quickpkg(pkg_meta, build_root, output_dir)
+            if not qp.get("ok"):
+                return {"ok": False, "stage": "package", "detail": qp}
+            return {"ok": True, "stage": "package", "detail": qp}
+        except Exception as e:
+            logger.exception("package failed: %s", e)
+            return {"ok": False, "stage": "package", "detail": {"error": str(e)}}
 
-    # ----------------------------
-    # packaging / artifact generation
-    # ----------------------------
-    def package_artifact(self, pkg_meta: Dict[str,Any], destdir: str, *, compress: str = "tar.gz") -> Dict[str,Any]:
-        """
-        Create an artifact (tarball) from destdir, produce SBOM metadata and optional signing.
-        """
-        pkg_name = pkg_meta.get("name")
-        version = pkg_meta.get("version")
-        ts = int(time.time())
-        artifact_name = f"{pkg_name}-{version}-{ts}.tar.gz" if compress == "tar.gz" else f"{pkg_name}-{version}-{ts}.tar"
-        artifact_path = os.path.join(self.package_output, artifact_name)
+    def publish(self, pkg_meta: Dict[str,Any], artifact_path: Path, dry_run: bool=False) -> Dict[str,Any]:
+        # Placeholder: integrate with repos (artifactory/s3/git) if required
+        # For now, we simply place artifact in CACHE_DIR / 'packages'
+        dst = CACHE_DIR / "packages"
+        dst.mkdir(parents=True, exist_ok=True)
         try:
-            with tarfile.open(artifact_path, "w:gz") as tar:
-                tar.add(destdir, arcname=f"{pkg_name}-{version}")
-            # generate simple SBOM
-            sbom = {
-                "package": pkg_name,
-                "version": version,
-                "built_at": ts,
-                "source": pkg_meta.get("source"),
-                "build_flags": pkg_meta.get("build", {}),
-            }
-            sbom_path = artifact_path + ".sbom.json"
-            with open(sbom_path, "w", encoding="utf-8") as f:
-                json.dump(sbom, f, indent=2, ensure_ascii=False)
-            logger.info("Packaged artifact %s (sbom: %s)", artifact_path, sbom_path)
-            return {"ok": True, "artifact": artifact_path, "sbom": sbom_path}
-        except Exception:
-            logger.exception("package_artifact failed")
-            return {"ok": False, "error": "package_failed"}
+            if dry_run:
+                logger.info("[dry-run] would publish %s to %s", artifact_path, dst)
+                return {"ok": True, "stage": "publish", "detail": {"artifact": str(artifact_path), "dest": str(dst)}}
+            shutil.copy2(str(artifact_path), str(dst / artifact_path.name))
+            return {"ok": True, "stage": "publish", "detail": {"artifact": str(artifact_path), "dest": str(dst / artifact_path.name)}}
+        except Exception as e:
+            logger.exception("publish failed: %s", e)
+            return {"ok": False, "stage": "publish", "detail": {"error": str(e)}}
 
-    # ----------------------------
-    # publish artifact (simple: move to registry path or call HTTP)
-    # ----------------------------
-    def publish(self, artifact_path: str, registry: Optional[str]=None, sign: bool=True) -> Dict[str,Any]:
-        registry = registry or self._cfg.get("buildsystem", {}).get("publish", {}).get("registry")
-        if not registry:
-            # fallback: keep in package_output and return path
-            logger.info("No registry configured; artifact at %s", artifact_path)
-            return {"ok": True, "published_path": artifact_path}
-        # if registry is a local path
-        if registry.startswith("http://") or registry.startswith("https://"):
-            # simple HTTP PUT is beyond scope - user can extend
-            logger.warning("Remote registry publishing not implemented in default buildsystem; keeping artifact local")
-            return {"ok": False, "error": "remote_publish_not_implemented"}
-        else:
-            try:
-                _ensure_dir(registry)
-                dst = os.path.join(registry, os.path.basename(artifact_path))
-                shutil.copy2(artifact_path, dst)
-                logger.info("Published artifact to %s", dst)
-                return {"ok": True, "published_path": dst}
-            except Exception:
-                logger.exception("publish failed")
-                return {"ok": False, "error": "publish_failed"}
-
-    # ----------------------------
-    # remove package (uninstall)
-    # ----------------------------
-    def remove_package(self, pkg_meta: Dict[str,Any]) -> Dict[str,Any]:
-        pkg_name = pkg_meta.get("name")
-        version = pkg_meta.get("version")
-        # consult DB for artifact or installed paths
+    def cleanup(self, workdir: Path, keep: bool=False) -> Dict[str,Any]:
+        if keep or KEEP_BUILD_DIRS:
+            logger.info("Keeping build dir %s per config", str(workdir))
+            return {"ok": True, "kept": True}
         try:
-            if self._db:
-                row = self._db.fetchone("SELECT artifacts_path FROM builds WHERE package = ? AND version = ? ORDER BY id DESC LIMIT 1", (pkg_name, version))
-                if row and row.get("artifacts_path"):
-                    path = row["artifacts_path"]
-                    if os.path.exists(path):
-                        os.remove(path)
-                    logger.info("Removed artifact %s", path)
-                    return {"ok": True}
-        except Exception:
-            logger.exception("remove_package failed")
-        # fallback: nothing to remove
-        logger.info("No artifact info for %s %s", pkg_name, version)
-        return {"ok": False, "error": "not_found"}
+            shutil.rmtree(str(workdir), ignore_errors=True)
+            return {"ok": True, "removed": True}
+        except Exception as e:
+            logger.exception("cleanup failed: %s", e)
+            return {"ok": False, "error": str(e)}
 
-    # ----------------------------
-    # high-level build orchestration
-    # ----------------------------
+    # --- main orchestration: build_package ---
     def build_package(self, pkg_meta: Dict[str,Any], *, force: bool=False, dry_run: bool=False, shards: Optional[int]=None) -> Dict[str,Any]:
         """
-        Orchestrate full build: prepare -> configure -> compile -> test -> install -> package -> publish -> cleanup
+        Build and install/package a package described by pkg_meta (dict).
+        Returns dict with ok, stage and detail.
         """
-        pkg_name = pkg_meta.get("name")
-        version = pkg_meta.get("version")
-        logger.info("Starting build for %s %s (force=%s)", pkg_name, version, force)
-        start_ts = _now_ts()
-        # check mask
-        if is_masked(pkg_name, version, None):
-            logger.warning("Package %s masked; aborting build", pkg_name)
-            return {"ok": False, "error": "masked"}
+        name = (pkg_meta.get("package") or {}).get("name") or f"pkg-{_uid()}"
+        version = (pkg_meta.get("package") or {}).get("version") or "0"
+        logger.info("BuildSystem: building %s-%s (dry_run=%s, force=%s, shards=%s)", name, version, dry_run, force, shards)
+        # pre-sync repos (optional)
+        if repo_sync_all:
+            try:
+                repo_sync_all()
+            except Exception:
+                logger.debug("repo_sync failed / unavailable")
 
-        # prepare
-        prep = self.prepare(pkg_meta, force=force)
-        if not prep.get("ok"):
-            logger.error("prepare failed: %s", prep)
-            return {"ok": False, "stage": "prepare", "detail": prep}
-
-        build_dir = prep["build_dir"]
-        destdir = prep["destdir"]
-
-        # configure
-        cfg_res = self.configure(pkg_meta, build_dir)
-        if not cfg_res.get("ok", cfg_res.get("exit_code",0) == 0):
-            logger.error("configure failed: %s", cfg_res)
-            return {"ok": False, "stage": "configure", "detail": cfg_res}
-
-        # compile
-        comp_res = self.compile(pkg_meta, build_dir, jobs=pkg_meta.get("build", {}).get("jobs"))
-        if not comp_res.get("ok", comp_res.get("exit_code",0) == 0):
-            logger.error("compile failed: %s", comp_res)
-            return {"ok": False, "stage": "compile", "detail": comp_res}
-
-        # optionally run tests
-        if pkg_meta.get("build", {}).get("run_tests", False):
-            test_res = self.test(pkg_meta, build_dir)
-            if not test_res.get("ok", test_res.get("exit_code",0) == 0):
-                logger.error("tests failed: %s", test_res)
-                return {"ok": False, "stage": "test", "detail": test_res}
-
-        # install (use fakeroot if configured)
-        use_fakeroot = bool(self._cfg.get("buildsystem",{}).get("use_fakeroot", False) or pkg_meta.get("build",{}).get("use_fakeroot", False))
-        inst_res = self.install(pkg_meta, build_dir, destdir=destdir, use_fakeroot=use_fakeroot)
-        if not inst_res.get("ok", inst_res.get("exit_code",0) == 0):
-            logger.error("install failed: %s", inst_res)
-            return {"ok": False, "stage": "install", "detail": inst_res}
-
-        # package artifact
-        pkg_res = self.package_artifact(pkg_meta, destdir)
-        if not pkg_res.get("ok"):
-            logger.error("package_artifact failed: %s", pkg_res)
-            return {"ok": False, "stage": "package", "detail": pkg_res}
-
-        artifact_path = pkg_res.get("artifact")
-        # publish
-        publish_cfg = pkg_meta.get("publish") or self._cfg.get("buildsystem", {}).get("publish", {})
-        if publish_cfg:
-            pub_res = self.publish(artifact_path, registry=publish_cfg.get("registry") or None, sign=publish_cfg.get("sign", True))
-        else:
-            pub_res = {"ok": True, "published_path": artifact_path}
-
-        end_ts = _now_ts()
-        duration = end_ts - start_ts
-
-        # record in DB
+        workdir = self.prepare_workdir(pkg_meta)
+        result_summary: Dict[str,Any] = {"ok": False, "package": name, "version": version, "started_at": _now_ts(), "stages": []}
         try:
-            if self._db:
-                self._db.execute("INSERT INTO builds (package, version, system, status, start_ts, end_ts, duration, log_path, artifacts_path, used_fakeroot, cache_hit) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                                 (pkg_name, version, pkg_meta.get("build",{}).get("system") or detect_build_system(build_dir), "success" if pub_res.get("ok") else "published_failed", start_ts, end_ts, float(duration), None, artifact_path, int(use_fakeroot), 0), commit=True)
-        except Exception:
-            logger.exception("Failed to write build record to DB")
-
-        # post_build hooks
-        if self._hooks:
+            # FETCH
+            fetch_res = self.fetch(pkg_meta, workdir, dry_run=dry_run)
+            result_summary["stages"].append({"stage": "fetch", "result": fetch_res})
+            if not fetch_res.get("ok") and not force:
+                return {"ok": False, "stage": "fetch", "detail": fetch_res}
+            # PREPARE
+            prep_res = self.prepare(pkg_meta, workdir, dry_run=dry_run)
+            result_summary["stages"].append({"stage": "prepare", "result": prep_res})
+            if not prep_res.get("ok") and not force:
+                return {"ok": False, "stage": "prepare", "detail": prep_res}
+            # determine srcdir (try common patterns)
+            srcdir = workdir
+            # if extraction happened and created a single dir, pick it
             try:
-                self._hooks.run("post_build", context={"pkg_meta": pkg_meta, "artifact": artifact_path}, package=pkg_name)
+                entries = [e for e in workdir.iterdir() if e.is_dir()]
+                if len(entries) == 1:
+                    srcdir = entries[0]
             except Exception:
-                logger.exception("post_build hook failed")
-
-        # cleanup build dirs if configured
-        if not self.keep_build_dirs:
+                pass
+            # configure/compile
+            cfg_res = self.configure(pkg_meta, srcdir, None, dry_run=dry_run)
+            result_summary["stages"].append({"stage": "configure", "result": cfg_res})
+            if not cfg_res.get("ok") and not force:
+                return {"ok": False, "stage": "configure", "detail": cfg_res}
+            # compile
+            comp_res = self.compile(pkg_meta, srcdir, None, shards=shards, dry_run=dry_run)
+            result_summary["stages"].append({"stage": "compile", "result": comp_res})
+            if not comp_res.get("ok") and not force:
+                return {"ok": False, "stage": "compile", "detail": comp_res}
+            # test
+            test_res = self.test(pkg_meta, srcdir, None, dry_run=dry_run)
+            result_summary["stages"].append({"stage": "test", "result": test_res})
+            if not test_res.get("ok") and not force:
+                return {"ok": False, "stage": "test", "detail": test_res}
+            # install
+            use_fakeroot = (pkg_meta.get("install", {}) or {}).get("fakeroot", DEFAULT_FAKEROOT)
+            inst_res = self.install(pkg_meta, srcdir, None, dry_run=dry_run, use_fakeroot=use_fakeroot)
+            result_summary["stages"].append({"stage": "install", "result": inst_res})
+            if not inst_res.get("ok") and not force:
+                return {"ok": False, "stage": "install", "detail": inst_res}
+            # package
+            outdir = Path(pkg_meta.get("package", {}).get("output_dir") or CACHE_DIR / "packages")
+            outdir.mkdir(parents=True, exist_ok=True)
+            pack_res = self.package(pkg_meta, srcdir, outdir, dry_run=dry_run)
+            result_summary["stages"].append({"stage": "package", "result": pack_res})
+            if not pack_res.get("ok") and not force:
+                return {"ok": False, "stage": "package", "detail": pack_res}
+            # publish
+            artifact = pack_res.get("detail", {}).get("artifact") if isinstance(pack_res.get("detail"), dict) else None
+            pub_res = {"ok": True, "skipped": True}
+            if artifact:
+                pub_res = self.publish(pkg_meta, Path(artifact), dry_run=dry_run)
+            result_summary["stages"].append({"stage": "publish", "result": pub_res})
+            if not pub_res.get("ok") and not force:
+                return {"ok": False, "stage": "publish", "detail": pub_res}
+            # audit if available
             try:
-                # remove build root (parent of build_dir)
-                build_root = os.path.dirname(build_dir)
-                shutil.rmtree(build_root, ignore_errors=True)
+                if self.auditor:
+                    self.auditor.audit_package_meta(pkg_meta)
             except Exception:
-                logger.exception("cleanup build dirs failed")
+                logger.debug("auditor audit failed or unavailable")
+            result_summary["ok"] = True
+            result_summary["finished_at"] = _now_ts()
+            # persist build record in DB if available
+            try:
+                if self.db:
+                    self.db.execute("CREATE TABLE IF NOT EXISTS builds (id TEXT PRIMARY KEY, pkg TEXT, version TEXT, started INTEGER, finished INTEGER, ok INTEGER, detail JSON)", (), commit=True)
+                    bid = f"bld-{_uid()}"
+                    self.db.execute("INSERT INTO builds (id, pkg, version, started, finished, ok, detail) VALUES (?,?,?,?,?,?,?)",
+                                    (bid, name, version, result_summary["started_at"], result_summary.get("finished_at") or _now_ts(), 1 if result_summary["ok"] else 0, json.dumps(result_summary)), commit=True)
+            except Exception:
+                logger.debug("DB build record failed")
+            emit_event("buildsystem.build.finished", {"pkg": name, "version": version, "ok": True})
+            return {"ok": True, "stage": "complete", "detail": result_summary}
+        except Exception as e:
+            logger.exception("build_package exception: %s", e)
+            emit_event("buildsystem.build.failed", {"pkg": name, "version": version, "error": str(e)})
+            return {"ok": False, "stage": "exception", "detail": {"error": str(e)}}
+        finally:
+            # cleanup
+            keep = pkg_meta.get("build", {}).get("keep_temps") or KEEP_BUILD_DIRS
+            if keep:
+                logger.info("Keeping build dir per config: %s", workdir)
+            else:
+                try:
+                    shutil.rmtree(str(workdir), ignore_errors=True)
+                except Exception:
+                    logger.debug("Cleanup of workdir failed")
 
-        logger.info("Build finished for %s %s in %ds", pkg_name, version, duration)
-        return {"ok": True, "artifact": artifact_path, "publish": pub_res, "duration": duration}
-
-    # ----------------------------
-    # helper: create builder
-    # ----------------------------
-    def _create_builder(self, builder_type: str, pkg_meta: Dict[str,Any], source_dir: str, build_dir: str, destdir: str) -> BaseBuilder:
-        builder_type = (builder_type or "").lower()
-        if builder_type == "autotools":
-            return AutotoolsBuilder(pkg_meta, source_dir, build_dir, destdir, self)
-        if builder_type == "cmake":
-            return CMakeBuilder(pkg_meta, source_dir, build_dir, destdir, self)
-        # TODO: meson, python, cargo, etc
-        return AutotoolsBuilder(pkg_meta, source_dir, build_dir, destdir, self)
-
-# ----------------------------
-# Module-level manager and convenience
-# ----------------------------
-_MANAGER_LOCK = threading.RLock()
-_MANAGER: Optional[BuildSystem] = None
-
+# --- module-level helper to get singleton BuildSystem ---
+_BS: Optional[BuildSystem] = None
 def get_buildsystem() -> BuildSystem:
-    global _MANAGER
-    with _MANAGER_LOCK:
-        if _MANAGER is None:
-            _MANAGER = BuildSystem()
-        return _MANAGER
+    global _BS
+    if _BS is None:
+        _BS = BuildSystem()
+    return _BS
 
-def build_package(*a, **k):
-    return get_buildsystem().build_package(*a, **k)
-
-def prepare(*a, **k):
-    return get_buildsystem().prepare(*a, **k)
-
-def configure(*a, **k):
-    return get_buildsystem().configure(*a, **k)
-
-def compile_package(*a, **k):
-    return get_buildsystem().compile(*a, **k)
-
-def install_package(*a, **k):
-    return get_buildsystem().install(*a, **k)
-
-def package_artifact(*a, **k):
-    return get_buildsystem().package_artifact(*a, **k)
-
-def publish(*a, **k):
-    return get_buildsystem().publish(*a, **k)
-
-# ----------------------------
-# CLI demo
-# ----------------------------
-if __name__ == "__main__":
+# --- convenience wrapper matching expected API ---
+def build_package(pkg_meta: Dict[str,Any], *, force: bool=False, dry_run: bool=False, shards: Optional[int]=None) -> Dict[str,Any]:
     bs = get_buildsystem()
-    print("BuildSystem ready.")
-    # Example minimal run with a hypothetical pkg_meta
-    example_meta = {
-        "name": "example",
-        "version": "0.1",
-        "source": None,  # set to a local tarball path to test
-        "build": {
-            "system": "autotools",
-            "cflags": ["-O2"],
-            "jobs": 2,
-            "use_fakeroot": False,
-            "run_tests": False
-        }
-    }
-    print("Call build_package(example) to test (ensure source present).")
+    return bs.build_package(pkg_meta, force=force, dry_run=dry_run, shards=shards)
